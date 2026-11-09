@@ -172,20 +172,15 @@ func main() {
 
 	updatePrebuffer := func(totalDelay int) {
 		var q int
-		if totalDelay <= 120 {
-			// Low-latency mode (Twitch):
-			// 70ms -> 1 chunk (10 ms Go buffer), 80ms -> 2 chunks, 90ms -> 3 chunks
+		if totalDelay <= 100 {
+			// Ultra low-latency mode (Twitch 70-80ms -> 1-2 chunks = 10-20 ms Go buffer):
 			q = (totalDelay - 60) / 10
-			if q < 1 {
-				q = 1 // Safety floor: minimum 1 chunk = 10 ms Go buffer
-			}
 		} else {
-			// Calibrated YouTube / film mode:
-			// 160ms -> 7 chunks (70 ms Go buffer)
+			// Calibrated media mode (Kinopub/Spotify 140-150ms -> 5-6 chunks, YouTube 160ms -> 7 chunks):
 			q = (totalDelay - 90) / 10
-			if q < 2 {
-				q = 2
-			}
+		}
+		if q < 1 {
+			q = 1 // Safety floor: minimum 1 chunk = 10 ms Go buffer
 		}
 		pre := q + 3 // Prime buffer before starting playback
 		atomic.StoreInt64(&atomicTargetQ, int64(q))
