@@ -50,15 +50,16 @@ public class AudioSyncService extends Service {
     public static volatile boolean isRunning = false;
     public static volatile String currentIp = "";
     public static volatile boolean isHeadphonesConnected = false;
+    public static volatile int globalDelayOffsetMs = 0;
 
     private volatile int currentTvVolume = 8;
     private volatile int currentStationVolume = 4;
     private volatile boolean currentIsMuted = false;
 
     // Dynamic delay calibration:
-    // Tunneled / AV-Sync apps (YouTube, KinoPub, 4K video) -> 210 ms
-    // Low-latency / live apps (Twitch AAudio)              -> 130 ms
-    private volatile int currentTargetDelayMs = 210;
+    // Tunneled / AV-Sync apps (YouTube, KinoPub, 4K video) -> 160 ms (calibrated with Dolby MS12)
+    // Low-latency / live apps (Twitch AAudio)              -> 80 ms
+    private volatile int currentTargetDelayMs = 160;
 
     private MediaProjection mediaProjection;
     private AudioRecord audioRecord;
@@ -139,6 +140,8 @@ public class AudioSyncService extends Service {
     private long lastEventsQueryTime = 0;
 
     private int detectOptimalDelay() {
+        int baseDelay = 160; // Default sweet spot for YouTube, Kinopub, and standard media players (calibrated with Dolby MS12)
+
         if (usageStatsManager != null) {
             try {
                 long now = System.currentTimeMillis();
@@ -161,20 +164,26 @@ public class AudioSyncService extends Service {
                 lastEventsQueryTime = now - 5000L; // Overlap by 5s
 
                 if (currentForegroundPkg.contains("twitch")) {
-                    return 80; // Twitch live stream low-latency mode (80 ms)
-                } else if (currentForegroundPkg.contains("youtube") || currentForegroundPkg.contains("kinopub")) {
-                    return 210; // YouTube / 4K movie tunneled AV-sync mode (210 ms)
+                    baseDelay = 80; // Twitch live stream low-latency mode (80 ms)
+                } else {
+                    baseDelay = 160; // YouTube / Kinopub / other media players (160 ms)
                 }
             } catch (Exception e) {
                 Log.w(TAG, "detectOptimalDelay error: " + e.getMessage());
             }
         }
-        return 210; // Default sweet spot
+
+        int effectiveDelay = baseDelay + globalDelayOffsetMs;
+        if (effectiveDelay < 40) effectiveDelay = 40;
+        if (effectiveDelay > 300) effectiveDelay = 300;
+        return effectiveDelay;
     }
 
     @Override
     public void onCreate() {
         super.onCreate();
+        android.content.SharedPreferences prefs = getSharedPreferences("audiosync", Context.MODE_PRIVATE);
+        globalDelayOffsetMs = prefs.getInt("delay_offset", 0);
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {

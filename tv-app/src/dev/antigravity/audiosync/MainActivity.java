@@ -17,6 +17,11 @@ public class MainActivity extends Activity {
     private TextView tvStatus;
     private EditText etIp;
     private Button btnToggle;
+    private TextView tvDelayInfo;
+    private Button btnDelayMinus;
+    private Button btnDelayReset;
+    private Button btnDelayPlus;
+    private int currentOffset = 0;
     private boolean isAutoStart = false;
 
     @Override
@@ -27,10 +32,47 @@ public class MainActivity extends Activity {
         tvStatus = findViewById(R.id.tvStatus);
         etIp = findViewById(R.id.etIp);
         btnToggle = findViewById(R.id.btnToggle);
+        tvDelayInfo = findViewById(R.id.tvDelayInfo);
+        btnDelayMinus = findViewById(R.id.btnDelayMinus);
+        btnDelayReset = findViewById(R.id.btnDelayReset);
+        btnDelayPlus = findViewById(R.id.btnDelayPlus);
 
-        android.content.SharedPreferences prefs = getSharedPreferences("audiosync", Context.MODE_PRIVATE);
+        final android.content.SharedPreferences prefs = getSharedPreferences("audiosync", Context.MODE_PRIVATE);
         String savedIp = prefs.getString("station_ip", "192.168.1.100");
         etIp.setText(savedIp);
+
+        updateDelayInfo(prefs);
+
+        btnDelayMinus.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (currentOffset > -100) {
+                    currentOffset -= 10;
+                    prefs.edit().putInt("delay_offset", currentOffset).apply();
+                    updateDelayInfo(prefs);
+                }
+            }
+        });
+
+        btnDelayReset.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                currentOffset = 0;
+                prefs.edit().putInt("delay_offset", currentOffset).apply();
+                updateDelayInfo(prefs);
+            }
+        });
+
+        btnDelayPlus.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (currentOffset < 100) {
+                    currentOffset += 10;
+                    prefs.edit().putInt("delay_offset", currentOffset).apply();
+                    updateDelayInfo(prefs);
+                }
+            }
+        });
 
         if (getIntent() != null) {
             isAutoStart = getIntent().getBooleanExtra("EXTRA_AUTO_START", false);
@@ -67,6 +109,15 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         updateUI();
+    }
+
+    private void updateDelayInfo(android.content.SharedPreferences prefs) {
+        currentOffset = prefs.getInt("delay_offset", 0);
+        AudioSyncService.globalDelayOffsetMs = currentOffset;
+        String sign = currentOffset > 0 ? "+" : "";
+        if (tvDelayInfo != null) {
+            tvDelayInfo.setText("Смещение: " + sign + currentOffset + " мс (YouTube/Кинопаб: " + (160 + currentOffset) + " мс, Twitch: " + (80 + currentOffset) + " мс)");
+        }
     }
 
     private void updateUI() {

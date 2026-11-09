@@ -64,4 +64,70 @@
             android:inputType="text" />
     </LinearLayout>
 
+    <View
+        android:layout_width="440dp"
+        android:layout_height="1dp"
+        android:background="#2A2A2A"
+        android:layout_marginTop="20dp"
+        android:layout_marginBottom="16dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Ручная микроподстройка (для всех приложений):"
+        android:textColor="#DDDDDD"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="6dp" />
+
+    <TextView
+        android:id="@+id/tvDelayInfo"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Смещение: 0 мс (YouTube/Кинопаб: 160 мс, Twitch: 80 мс)"
+        android:textColor="#00E5FF"
+        android:textSize="15sp"
+        android:layout_marginBottom="16dp" />
+
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center">
+
+        <Button
+            android:id="@+id/btnDelayMinus"
+            android:layout_width="110dp"
+            android:layout_height="48dp"
+            android:text="- 10 мс"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:background="#37474F"
+            android:textColor="#FFFFFF"
+            android:focusable="true"
+            android:layout_marginEnd="12dp" />
+
+        <Button
+            android:id="@+id/btnDelayReset"
+            android:layout_width="100dp"
+            android:layout_height="48dp"
+            android:text="Сброс (0)"
+            android:textSize="14sp"
+            android:background="#263238"
+            android:textColor="#B0BEC5"
+            android:focusable="true"
+            android:layout_marginEnd="12dp" />
+
+        <Button
+            android:id="@+id/btnDelayPlus"
+            android:layout_width="110dp"
+            android:layout_height="48dp"
+            android:text="+ 10 мс"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:background="#37474F"
+            android:textColor="#FFFFFF"
+            android:focusable="true" />
+    </LinearLayout>
+
 </LinearLayout>
