@@ -197,7 +197,7 @@ func main() {
 	fmt.Fprintf(os.Stderr, "[station-rx] Started listening on UDP4 %s with EMA Drift Servo (Calibrated: %d ms)\n",
 		addr.String(), atomic.LoadInt64(&atomicTargetDelay))
 
-	queue := make(chan []byte, 100)
+	queue := make(chan []byte, 200)
 	var lastPacketNano int64
 	var rxPkts, droppedPkts, duplicatePkts, resyncEvents uint64
 	var lastSeq uint32
@@ -271,8 +271,8 @@ func main() {
 					isMuted := buf[14] != 0
 					tvTargetDelayUnits := int(buf[15])
 
-					// Dynamic Target Delay from TV header (byte 15: delay / 10)
-					if tvTargetDelayUnits >= 5 && tvTargetDelayUnits <= 40 {
+					// Dynamic Target Delay from TV header (byte 15: delay / 10, support up to 1200 ms)
+					if tvTargetDelayUnits >= 4 && tvTargetDelayUnits <= 120 {
 						tvDelayMs := tvTargetDelayUnits * 10
 						atomic.StoreInt64(&lastTvDelayUpdate, time.Now().UnixNano())
 						curDelay := int(atomic.LoadInt64(&atomicTargetDelay))

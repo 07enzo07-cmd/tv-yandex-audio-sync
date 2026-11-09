@@ -242,7 +242,7 @@ public class MainActivity extends Activity {
         AudioSyncService.globalDelayOffsetMs = currentOffset;
         String sign = currentOffset > 0 ? "+" : "";
         if (tvDelayInfo != null) {
-            tvDelayInfo.setText("Смещение: " + sign + currentOffset + " мс (YouTube: " + (160 + currentOffset) + " мс, Кинопаб: " + (110 + currentOffset) + " мс, Twitch: " + (70 + currentOffset) + " мс)");
+            tvDelayInfo.setText("Смещение: " + sign + currentOffset + " мс (YouTube: " + (160 + currentOffset) + " мс, Кинопаб: " + (480 + currentOffset) + " мс, Spotify: " + (800 + currentOffset) + " мс, Twitch: " + (70 + currentOffset) + " мс)");
         }
     }
 

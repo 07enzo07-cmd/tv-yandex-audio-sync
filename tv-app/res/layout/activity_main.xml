@@ -97,7 +97,7 @@
             android:id="@+id/tvDelayInfo"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Смещение: 0 мс (YouTube: 160 мс, Кинопаб: 110 мс, Twitch: 70 мс)"
+            android:text="Смещение: 0 мс (YouTube: 160 мс, Кинопаб: 480 мс, Spotify: 800 мс, Twitch: 70 мс)"
             android:textColor="#00E5FF"
             android:textSize="14sp"
             android:layout_marginBottom="12dp" />

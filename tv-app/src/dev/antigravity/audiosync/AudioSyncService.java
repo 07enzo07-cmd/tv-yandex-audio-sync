@@ -166,7 +166,9 @@ public class AudioSyncService extends Service {
                 if (currentForegroundPkg.contains("twitch")) {
                     baseDelay = 70; // Twitch live stream low-latency mode (70 ms, calibrated)
                 } else if (currentForegroundPkg.contains("watch.kino") || currentForegroundPkg.contains("kinopub")) {
-                    baseDelay = 110; // Kinopub multichannel 5.1 stream mode (110 ms, calibrated)
+                    baseDelay = 480; // Kinopub multichannel 5.1 stream mode (480 ms, calibrated to 660ms AudioTrack)
+                } else if (currentForegroundPkg.contains("spotify")) {
+                    baseDelay = 800; // Spotify audio streaming mode (800 ms, calibrated to 1005ms AudioTrack)
                 } else {
                     baseDelay = 160; // YouTube / other media players (160 ms)
                 }
@@ -177,7 +179,7 @@ public class AudioSyncService extends Service {
 
         int effectiveDelay = baseDelay + globalDelayOffsetMs;
         if (effectiveDelay < 40) effectiveDelay = 40;
-        if (effectiveDelay > 300) effectiveDelay = 300;
+        if (effectiveDelay > 1200) effectiveDelay = 1200;
         return effectiveDelay;
     }
 
