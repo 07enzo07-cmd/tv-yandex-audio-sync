@@ -1,0 +1,17 @@
+# Build directories and binaries
+bin/
+*.apk
+*.idsig
+*.class
+*.dex
+station-daemon/station-rx
+
+# OS & Editor
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Keystores (keep debug.keystore if desired, or ignore secrets)
+*.jks
