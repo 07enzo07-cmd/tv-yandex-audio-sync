@@ -5,6 +5,7 @@ bin/
 *.class
 *.dex
 station-daemon/station-rx
+tv-app/src/**/R.java
 
 # OS & Editor
 .DS_Store

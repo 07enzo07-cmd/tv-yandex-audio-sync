@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Focused on TV Remote -->
+    <item android:state_focused="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#00E5FF" />
+            <corners android:radius="8dp" />
+            <stroke android:width="3dp" android:color="#FFFFFF" />
+        </shape>
+    </item>
+    <!-- Pressed -->
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#00B0FF" />
+            <corners android:radius="8dp" />
+        </shape>
+    </item>
+    <!-- Normal -->
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#37474F" />
+            <corners android:radius="8dp" />
+            <stroke android:width="1dp" android:color="#607D8B" />
+        </shape>
+    </item>
+</selector>

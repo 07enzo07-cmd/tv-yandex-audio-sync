@@ -164,7 +164,7 @@ public class AudioSyncService extends Service {
                 lastEventsQueryTime = now - 5000L; // Overlap by 5s
 
                 if (currentForegroundPkg.contains("twitch")) {
-                    baseDelay = 80; // Twitch live stream low-latency mode (80 ms)
+                    baseDelay = 70; // Twitch live stream low-latency mode (70 ms, calibrated)
                 } else {
                     baseDelay = 160; // YouTube / Kinopub / other media players (160 ms)
                 }

@@ -174,17 +174,17 @@ func main() {
 		var q int
 		if totalDelay <= 120 {
 			// Low-latency mode (Twitch):
-			// 80ms -> 2 chunks (20 ms Go buffer), 90ms -> 3 chunks, 100ms -> 4 chunks
+			// 70ms -> 1 chunk (10 ms Go buffer), 80ms -> 2 chunks, 90ms -> 3 chunks
 			q = (totalDelay - 60) / 10
-			if q < 2 {
-				q = 2 // Safety floor: minimum 2 chunks = 20 ms Go buffer
+			if q < 1 {
+				q = 1 // Safety floor: minimum 1 chunk = 10 ms Go buffer
 			}
 		} else {
 			// Calibrated YouTube / film mode:
-			// 210ms -> 12 chunks (120 ms Go buffer)
+			// 160ms -> 7 chunks (70 ms Go buffer)
 			q = (totalDelay - 90) / 10
-			if q < 4 {
-				q = 4
+			if q < 2 {
+				q = 2
 			}
 		}
 		pre := q + 3 // Prime buffer before starting playback

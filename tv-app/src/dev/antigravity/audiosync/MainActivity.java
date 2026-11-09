@@ -92,15 +92,17 @@ public class MainActivity extends Activity {
                 if (AudioSyncService.isRunning) {
                     stopSyncService();
                 } else {
+                    btnToggle.setEnabled(false);
+                    btnToggle.setText("ПОДКЛЮЧЕНИЕ...");
                     startCapturePermission();
                 }
             }
         });
 
-        // If not already running, auto-trigger capture
-        if (!AudioSyncService.isRunning) {
+        // Only auto-trigger capture if launched via boot / auto-start
+        if (isAutoStart && !AudioSyncService.isRunning) {
             startCapturePermission();
-        } else if (isAutoStart) {
+        } else if (isAutoStart && AudioSyncService.isRunning) {
             finish();
         }
     }
@@ -108,6 +110,8 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        final android.content.SharedPreferences prefs = getSharedPreferences("audiosync", Context.MODE_PRIVATE);
+        updateDelayInfo(prefs);
         updateUI();
     }
 
@@ -116,11 +120,13 @@ public class MainActivity extends Activity {
         AudioSyncService.globalDelayOffsetMs = currentOffset;
         String sign = currentOffset > 0 ? "+" : "";
         if (tvDelayInfo != null) {
-            tvDelayInfo.setText("Смещение: " + sign + currentOffset + " мс (YouTube/Кинопаб: " + (160 + currentOffset) + " мс, Twitch: " + (80 + currentOffset) + " мс)");
+            tvDelayInfo.setText("Смещение: " + sign + currentOffset + " мс (YouTube/Кинопаб: " + (160 + currentOffset) + " мс, Twitch: " + (70 + currentOffset) + " мс)");
         }
     }
 
     private void updateUI() {
+        if (btnToggle == null) return;
+        btnToggle.setEnabled(true);
         if (AudioSyncService.isRunning) {
             if (AudioSyncService.isHeadphonesConnected) {
                 tvStatus.setText("Статус: Наушники подключены (колонка на паузе)");
@@ -130,12 +136,12 @@ public class MainActivity extends Activity {
                 tvStatus.setTextColor(0xFF4CAF50); // Green
             }
             btnToggle.setText("ВЫКЛЮЧИТЬ СИНХРОНИЗАЦИЮ");
-            btnToggle.setBackgroundColor(0xFFE53935); // Red
+            btnToggle.setBackgroundResource(R.drawable.btn_toggle_stop);
         } else {
             tvStatus.setText("Статус: Остановлено");
             tvStatus.setTextColor(0xFF888888);
             btnToggle.setText("ВКЛЮЧИТЬ СИНХРОНИЗАЦИЮ");
-            btnToggle.setBackgroundColor(0xFF1E88E5); // Blue
+            btnToggle.setBackgroundResource(R.drawable.btn_toggle_start);
         }
     }
 
@@ -157,6 +163,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         if (requestCode == REQUEST_CODE_CAPTURE) {
+            btnToggle.setEnabled(true);
             if (resultCode == Activity.RESULT_OK && data != null) {
                 String ip = etIp.getText().toString().trim();
                 if (ip.isEmpty()) ip = "192.168.1.100";
@@ -169,11 +176,14 @@ public class MainActivity extends Activity {
                 serviceIntent.putExtra(AudioSyncService.EXTRA_IP, ip);
 
                 startForegroundService(serviceIntent);
+                AudioSyncService.isRunning = true;
+                AudioSyncService.currentIp = ip;
                 updateUI();
                 if (isAutoStart) {
                     finish();
                 }
             } else {
+                updateUI();
                 Toast.makeText(this, "Разрешение на захват звука отклонено", Toast.LENGTH_LONG).show();
             }
         }
