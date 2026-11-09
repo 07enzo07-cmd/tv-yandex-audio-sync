@@ -34,6 +34,12 @@ public class MainActivity extends Activity {
 
         if (getIntent() != null) {
             isAutoStart = getIntent().getBooleanExtra("EXTRA_AUTO_START", false);
+            String extraIp = getIntent().getStringExtra("EXTRA_IP");
+            if (extraIp != null && !extraIp.isEmpty()) {
+                savedIp = extraIp;
+                etIp.setText(savedIp);
+                prefs.edit().putString("station_ip", savedIp).apply();
+            }
         }
 
         updateUI();

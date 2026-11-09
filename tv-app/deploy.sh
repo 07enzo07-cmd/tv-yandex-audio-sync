@@ -34,7 +34,8 @@ $ADB -s "$TV_IP:5555" install -r -g TvAudioSync.apk
 
 echo "Выдача фоновых разрешений (AppOps)..."
 $ADB -s "$TV_IP:5555" shell appops set dev.antigravity.audiosync PROJECT_MEDIA allow
-$ADB -s "$TV_IP:5555" shell appops set dev.antigravity.audiosync PACKAGE_USAGE_STATS allow
+$ADB -s "$TV_IP:5555" shell appops set dev.antigravity.audiosync PACKAGE_USAGE_STATS allow 2>/dev/null || true
+$ADB -s "$TV_IP:5555" shell appops set dev.antigravity.audiosync SYSTEM_ALERT_WINDOW allow
 
 echo "Запуск службы..."
 $ADB -s "$TV_IP:5555" shell am start -n dev.antigravity.audiosync/.MainActivity --ez EXTRA_AUTO_START true
