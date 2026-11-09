@@ -37,6 +37,7 @@ $ADB -s "$TV_IP:5555" shell appops set dev.antigravity.audiosync PROJECT_MEDIA a
 $ADB -s "$TV_IP:5555" shell appops set dev.antigravity.audiosync GET_USAGE_STATS allow 2>/dev/null || true
 $ADB -s "$TV_IP:5555" shell appops set dev.antigravity.audiosync PACKAGE_USAGE_STATS allow 2>/dev/null || true
 $ADB -s "$TV_IP:5555" shell appops set dev.antigravity.audiosync SYSTEM_ALERT_WINDOW allow
+$ADB -s "$TV_IP:5555" shell pm grant dev.antigravity.audiosync android.permission.WRITE_SECURE_SETTINGS 2>/dev/null || true
 
 echo "Запуск службы..."
 $ADB -s "$TV_IP:5555" shell am start -n dev.antigravity.audiosync/.MainActivity --ez EXTRA_AUTO_START true

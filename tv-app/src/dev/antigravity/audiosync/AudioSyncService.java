@@ -165,8 +165,10 @@ public class AudioSyncService extends Service {
 
                 if (currentForegroundPkg.contains("twitch")) {
                     baseDelay = 70; // Twitch live stream low-latency mode (70 ms, calibrated)
+                } else if (currentForegroundPkg.contains("watch.kino") || currentForegroundPkg.contains("kinopub")) {
+                    baseDelay = 110; // Kinopub multichannel 5.1 stream mode (110 ms, calibrated)
                 } else {
-                    baseDelay = 160; // YouTube / Kinopub / other media players (160 ms)
+                    baseDelay = 160; // YouTube / other media players (160 ms)
                 }
             } catch (Exception e) {
                 Log.w(TAG, "detectOptimalDelay error: " + e.getMessage());
