@@ -126,6 +126,8 @@ public class MainActivity extends Activity {
                     setGlobalAudioSetting("sound_advanced_dolby_atmos", 1);
                     setGlobalAudioSetting("sound_bass_enhancement", 1);
                     setGlobalAudioSetting("sound_advanced_dialogue_enhancer", 1);
+                    setGlobalAudioSetting("sound_auto_volume_leveling", 0);
+                    setGlobalAudioSetting("sound_dts_limiter", 0);
                     updateAllSoundModuleButtons();
                     Toast.makeText(MainActivity.this, "Включен набор: Atmos + Virtualizer + Bass + Речь", Toast.LENGTH_SHORT).show();
                 }
@@ -140,6 +142,8 @@ public class MainActivity extends Activity {
                     for (SoundModule mod : soundModules) {
                         setGlobalAudioSetting(mod.settingKey, 0);
                     }
+                    setGlobalAudioSetting("sound_auto_volume_leveling", 0);
+                    setGlobalAudioSetting("sound_dts_limiter", 0);
                     updateAllSoundModuleButtons();
                     Toast.makeText(MainActivity.this, "Все модули звука отключены", Toast.LENGTH_SHORT).show();
                 }

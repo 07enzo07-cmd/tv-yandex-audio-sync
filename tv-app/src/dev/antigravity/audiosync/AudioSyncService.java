@@ -140,7 +140,7 @@ public class AudioSyncService extends Service {
     private long lastEventsQueryTime = 0;
 
     private int detectOptimalDelay() {
-        int baseDelay = 160; // Default sweet spot for YouTube, Kinopub, and standard media players (calibrated with Dolby MS12)
+        int baseDelay = 150; // Sweet spot for YouTube, Kinopub, and Spotify (calibrated to TV AudioOut_D ~161.5ms latency)
 
         if (usageStatsManager != null) {
             try {
@@ -164,13 +164,13 @@ public class AudioSyncService extends Service {
                 lastEventsQueryTime = now - 5000L; // Overlap by 5s
 
                 if (currentForegroundPkg.contains("twitch")) {
-                    baseDelay = 60; // Twitch live stream low-latency mode (60 ms)
+                    baseDelay = 80; // Twitch live stream low-latency mode (80 ms)
                 } else if (currentForegroundPkg.contains("watch.kino") || currentForegroundPkg.contains("kinopub")) {
-                    baseDelay = 60; // Kinopub native stream mode (60 ms)
+                    baseDelay = 150; // Kinopub native stream mode (150 ms)
                 } else if (currentForegroundPkg.contains("spotify")) {
-                    baseDelay = 60; // Spotify audio streaming mode (60 ms)
+                    baseDelay = 150; // Spotify audio streaming mode (150 ms)
                 } else {
-                    baseDelay = 140; // YouTube / other media players (140 ms)
+                    baseDelay = 150; // YouTube / other media players (150 ms)
                 }
             } catch (Exception e) {
                 Log.w(TAG, "detectOptimalDelay error: " + e.getMessage());
@@ -343,7 +343,7 @@ public class AudioSyncService extends Service {
                             .setAudioFormat(format)
                             .setBufferSizeInBytes(bufSize)
                             .setTransferMode(AudioTrack.MODE_STREAM)
-                            .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                            .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_NONE)
                             .build();
 
                     keepAliveTrack.setVolume(0.0f); // 100% silent, keeps HAL & PatchTrack alive
@@ -461,6 +461,14 @@ public class AudioSyncService extends Service {
                     byte[] sendBuffer = new byte[16 + 1920];
                     ByteBuffer bb = ByteBuffer.wrap(sendBuffer);
                     bb.order(ByteOrder.BIG_ENDIAN);
+
+                    // Drain initial burst / backlog from AudioRecord to ensure minimum capture latency
+                    if (audioRecord != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        byte[] drainBuf = new byte[4096];
+                        while (audioRecord.read(drainBuf, 0, drainBuf.length, AudioRecord.READ_NON_BLOCKING) > 0) {
+                            // Discard pre-existing backlog
+                        }
+                    }
 
                     long packetCount = 0;
                     long lastLogTime = System.currentTimeMillis();

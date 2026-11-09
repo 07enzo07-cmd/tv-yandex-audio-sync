@@ -109,13 +109,13 @@ func (p *Player) Stop() {
 
 		select {
 		case <-done:
-		case <-time.After(80 * time.Millisecond):
+		case <-time.After(200 * time.Millisecond):
 			if pid > 0 {
 				syscall.Kill(pid, syscall.SIGTERM)
 			}
 			select {
 			case <-done:
-			case <-time.After(50 * time.Millisecond):
+			case <-time.After(150 * time.Millisecond):
 				if pid > 0 {
 					syscall.Kill(pid, syscall.SIGKILL)
 				}
@@ -123,10 +123,6 @@ func (p *Player) Stop() {
 			}
 		}
 	}
-
-	exec.Command("ipcrm", "-S", "1024").Run()
-	exec.Command("ipcrm", "-M", "1024").Run()
-	exec.Command("ipcrm", "-M", "1025").Run()
 }
 
 func (p *Player) IsRunning() bool {
@@ -147,9 +143,6 @@ func main() {
 	}
 
 	exec.Command("killall", "-9", "aplay").Run()
-	exec.Command("ipcrm", "-S", "1024").Run()
-	exec.Command("ipcrm", "-M", "1024").Run()
-	exec.Command("ipcrm", "-M", "1025").Run()
 
 	addr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:"+port)
 	if err != nil {
@@ -165,43 +158,68 @@ func main() {
 	defer conn.Close()
 	conn.SetReadBuffer(524288)
 
+	player := &Player{}
+	silenceChunk := make([]byte, chunkPcmLen)
+
 	var atomicTargetDelay int64 = int64(getTargetDelayMs())
 	var atomicPrebuffer int64
 	var atomicTargetQ int64
 	var lastTvDelayUpdate int64
+	var rxPkts, droppedPkts, duplicatePkts, resyncEvents uint64
+	queue := make(chan []byte, 200)
 
 	updatePrebuffer := func(totalDelay int) {
-		var q int
-		if totalDelay <= 100 {
-			// Ultra low-latency / non-tunneled mode (Spotify/Kinopub/Twitch 60ms -> 1 chunk = 10 ms Go buffer):
-			q = (totalDelay - 50) / 10
-		} else {
-			// Tunneled 4K video mode (YouTube 140ms -> 5 chunks = 50 ms Go buffer):
-			q = (totalDelay - 90) / 10
-		}
+		oldTargetQ := int(atomic.LoadInt64(&atomicTargetQ))
+		oldDelay := int(atomic.LoadInt64(&atomicTargetDelay))
+
+		// Unified linear queue formula: Base ALSA + pipe + net latency is ~40 ms
+		q := (totalDelay - 40) / 10
 		if q < 1 {
 			q = 1 // Safety floor: minimum 1 chunk = 10 ms Go buffer
 		}
-		pre := q + 3 // Prime buffer before starting playback
+		pre := q + 2 // Prime buffer before starting playback
+
 		atomic.StoreInt64(&atomicTargetQ, int64(q))
 		atomic.StoreInt64(&atomicPrebuffer, int64(pre))
 		atomic.StoreInt64(&atomicTargetDelay, int64(totalDelay))
+
+		// Dynamic Delay Adjustment during active playback (only executes when target delay changes!)
+		if player.IsRunning() && oldDelay > 0 && totalDelay != oldDelay {
+			if q > oldTargetQ {
+				diff := q - oldTargetQ
+				for i := 0; i < diff; i++ {
+					_ = player.Write(silenceChunk)
+				}
+				fmt.Fprintf(os.Stderr, "[station-rx] Dynamic Delay Expansion: %d -> %d ms, injected %d silence chunks (targetQ: %d)\n",
+					oldDelay, totalDelay, diff, q)
+			} else if q < oldTargetQ {
+				diff := oldTargetQ - q
+				dropCount := 0
+				for i := 0; i < diff && len(queue) > 1; i++ {
+					select {
+					case <-queue:
+						atomic.AddUint64(&droppedPkts, 1)
+						dropCount++
+					default:
+						break
+					}
+				}
+				fmt.Fprintf(os.Stderr, "[station-rx] Dynamic Delay Reduction: %d -> %d ms, dropped %d chunks (targetQ: %d)\n",
+					oldDelay, totalDelay, dropCount, q)
+			}
+		}
 	}
 	updatePrebuffer(int(atomicTargetDelay))
 
 	fmt.Fprintf(os.Stderr, "[station-rx] Started listening on UDP4 %s with EMA Drift Servo (Calibrated: %d ms)\n",
 		addr.String(), atomic.LoadInt64(&atomicTargetDelay))
 
-	queue := make(chan []byte, 200)
 	var lastPacketNano int64
-	var rxPkts, droppedPkts, duplicatePkts, resyncEvents uint64
 	var lastSeq uint32
 	var hasSeq bool
 	var lastStationVol int = -1
 	var lastMuted bool = false
 	var hasVol bool = false
-
-	player := &Player{}
 
 	// 1. TV Standby Watchdog (triggers 1500 ms after TV screen turns OFF or headphones connect)
 	go func() {
@@ -365,10 +383,8 @@ func main() {
 	}()
 
 	// 5. Main Playback Loop with EMA Closed-Loop Drift Servo
-	silenceChunk := make([]byte, chunkPcmLen)
-
 	for {
-		pre := int(atomic.LoadInt64(&atomicPrebuffer)) // e.g. 18 chunks for 210 ms, 10 chunks for 130 ms
+		pre := int(atomic.LoadInt64(&atomicPrebuffer))
 		for len(queue) < pre {
 			time.Sleep(5 * time.Millisecond)
 		}
@@ -391,11 +407,10 @@ func main() {
 			continue
 		}
 		curTotalDelay := int(atomic.LoadInt64(&atomicTargetDelay))
-		fmt.Fprintf(os.Stderr, "[station-rx] aplay started (pid %d) locked at %d ms delay\n", player.pid, curTotalDelay)
-
 		targetQ := int(atomic.LoadInt64(&atomicTargetQ))
+		fmt.Fprintf(os.Stderr, "[station-rx] aplay started (pid %d) locked at %d ms delay (targetQ: %d)\n", player.pid, curTotalDelay, targetQ)
 
-		// Prime queue to targetQ + 2 on startup so when aplay drains its initial buffer, queue settles exactly at targetQ
+		// Prime queue so when aplay drains its initial period, queue settles at targetQ
 		for len(queue) > targetQ+2 {
 			select {
 			case <-queue:
@@ -409,30 +424,12 @@ func main() {
 
 		for player.IsRunning() {
 			targetQ = int(atomic.LoadInt64(&atomicTargetQ))
-
 			curQLen := len(queue)
 
-			// 1. Dynamic Delay Expansion (e.g. TV switched from Twitch 130ms to YouTube 210ms):
-			// Target queue expands from 4 to 12. Inject silence into speaker so incoming packets fill the queue immediately!
-			if targetQ > curQLen+3 {
-				deficit := targetQ - curQLen
-				for i := 0; i < deficit; i++ {
-					_ = player.Write(silenceChunk)
-				}
-				emaQLen = float64(targetQ)
-				fmt.Fprintf(os.Stderr, "[station-rx] Delay expansion: injected %d silence chunks -> locked at %d ms (targetQ: %d)\n",
-					deficit, atomic.LoadInt64(&atomicTargetDelay), targetQ)
-				curQLen = len(queue)
-			}
-
-			// 2. Instant Unpause / Delay Reduction Burst Clamp:
-			clampThreshold := 4
-			if targetQ <= 3 {
-				clampThreshold = 3
-			}
-			if curQLen >= targetQ+clampThreshold {
+			// Emergency overflow clamp: only triggers if a massive stall / seek filled the queue (> targetQ + 20)
+			if curQLen >= targetQ+20 {
 				dropCount := 0
-				for len(queue) > targetQ {
+				for len(queue) > targetQ+2 {
 					select {
 					case <-queue:
 						atomic.AddUint64(&droppedPkts, 1)
@@ -443,8 +440,7 @@ func main() {
 				}
 				emaQLen = float64(targetQ)
 				if dropCount > 0 {
-					fmt.Fprintf(os.Stderr, "[station-rx] Burst clamp: trimmed +%d chunks -> locked at %d ms (qlen: %d)\n",
-						dropCount, atomic.LoadInt64(&atomicTargetDelay), len(queue))
+					fmt.Fprintf(os.Stderr, "[station-rx] Massive overflow clamp: trimmed +%d chunks (qlen: %d)\n", dropCount, len(queue))
 				}
 				curQLen = len(queue)
 			}
@@ -452,33 +448,32 @@ func main() {
 			// Update Exponential Moving Average (alpha=0.03, ~300ms smoothing window)
 			emaQLen = 0.03*float64(curQLen) + 0.97*emaQLen
 
-			// 3. High-Precision EMA Drift Servo (Deadband: [targetQ - deadband .. targetQ + deadband]):
-			deadband := 1.8
-			if targetQ <= 3 {
-				deadband = 1.2
-			}
+			// High-Precision EMA Drift Servo (Deadband: 2.5 chunks so UDP arrival jitter doesn't trigger spurious drops/dups)
+			deadband := 2.5
 			now := time.Now()
 			if now.Sub(lastDriftAdjust) >= 3000*time.Millisecond {
-				if emaQLen >= float64(targetQ)+deadband { // Persistent surplus
+				if emaQLen >= float64(targetQ)+deadband { // Persistent surplus (clock drift)
 					select {
 					case <-queue:
 						atomic.AddUint64(&droppedPkts, 1)
+						emaQLen -= 1.0
 						lastDriftAdjust = now
 						fmt.Fprintf(os.Stderr, "[station-rx] EMA Servo: dropped 1 chunk (ema: %.2f, qlen: %d) -> locked at %d ms\n",
 							emaQLen, len(queue), atomic.LoadInt64(&atomicTargetDelay))
 					default:
 					}
-				} else if emaQLen <= float64(targetQ)-deadband && curQLen >= 1 { // Persistent deficit
+				} else if emaQLen <= float64(targetQ)-deadband && curQLen >= 1 { // Persistent deficit (clock drift)
 					_ = player.Write(silenceChunk)
 					atomic.AddUint64(&duplicatePkts, 1)
+					emaQLen += 1.0
 					lastDriftAdjust = now
 					fmt.Fprintf(os.Stderr, "[station-rx] EMA Servo: injected 1 silence chunk (ema: %.2f, qlen: %d) -> locked at %d ms\n",
 						emaQLen, len(queue), atomic.LoadInt64(&atomicTargetDelay))
-					continue // Skip reading from queue on this tick so queue gains 1 chunk from TV
+					continue // Skip reading from queue on this tick so queue gains 1 chunk
 				}
 			}
 
-			// 3. Normal read and play next audio chunk
+			// Normal read and play next audio chunk
 			select {
 			case chunk := <-queue:
 				if err := player.Write(chunk); err != nil {
