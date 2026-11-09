@@ -97,7 +97,7 @@
             android:id="@+id/tvDelayInfo"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Смещение: 0 мс (YouTube: 160 мс, Кинопаб: 150 мс, Spotify: 150 мс, Twitch: 80 мс)"
+            android:text="Смещение: 0 мс (YouTube: 140 мс, Кинопаб: 60 мс, Spotify: 60 мс, Twitch: 60 мс)"
             android:textColor="#00E5FF"
             android:textSize="14sp"
             android:layout_marginBottom="12dp" />
@@ -165,7 +165,7 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="🎛️ Аппаратные модули звука (скрытые в Android TV)"
+            android:text="🎛️ Аппаратные модули звука (чип MediaTek)"
             android:textColor="#FFFFFF"
             android:textSize="17sp"
             android:textStyle="bold"
@@ -174,7 +174,7 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Прямое переключение DSP чипа MediaTek (эффект применяется мгновенно)"
+            android:text="Прямое переключение DSP сопроцессора без задержек и перезагрузок"
             android:textColor="#888888"
             android:textSize="13sp"
             android:layout_marginBottom="12dp" />
@@ -191,14 +191,14 @@
                 android:id="@+id/btnPresetAtmos"
                 android:layout_width="260dp"
                 android:layout_height="42dp"
-                android:text="★ ВКЛЮЧИТЬ НАБОР ATMOS"
+                android:text="★ НАБОР ДЛЯ КИНОТЕАТРА"
                 android:textSize="13sp"
                 android:textStyle="bold"
                 android:background="@drawable/btn_action"
                 android:textColor="@color/btn_action_text"
                 android:focusable="true"
                 android:nextFocusUp="@+id/btnDelayReset"
-                android:nextFocusDown="@+id/btnModDolbyAtmos"
+                android:nextFocusDown="@+id/btnModSurroundVirt"
                 android:nextFocusRight="@+id/btnPresetReset"
                 android:layout_marginEnd="16dp" />
 
@@ -212,11 +212,32 @@
                 android:textColor="@color/btn_reset_text"
                 android:focusable="true"
                 android:nextFocusUp="@+id/btnDelayReset"
-                android:nextFocusDown="@+id/btnModDolbyAtmos"
+                android:nextFocusDown="@+id/btnModSurroundVirt"
                 android:nextFocusLeft="@+id/btnPresetAtmos" />
         </LinearLayout>
 
-        <!-- 1. Dolby Atmos -->
+        <!-- ============================================================ -->
+        <!-- CATEGORY 1: 3D SPATIAL VIRTUALIZERS (EXCLUSIVE: ONLY 1 OF 5) -->
+        <!-- ============================================================ -->
+        <TextView
+            android:layout_width="650dp"
+            android:layout_height="wrap_content"
+            android:text="🌐 1. ПРОСТРАНСТВЕННОЕ 3D-ЗВУЧАНИЕ (ТОЛЬКО ОДИН ИЗ 5)"
+            android:textColor="#00E5FF"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="2dp" />
+
+        <TextView
+            android:layout_width="650dp"
+            android:layout_height="wrap_content"
+            android:text="Защита от конфликта фаз: включение одного автоматически выключает остальные."
+            android:textColor="#888888"
+            android:textSize="12sp"
+            android:layout_marginBottom="10dp" />
+
+        <!-- 1.1 Dolby Surround Virtualizer -->
         <LinearLayout
             android:layout_width="650dp"
             android:layout_height="wrap_content"
@@ -235,7 +256,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="1. Dolby Atmos (DAP)"
+                    android:text="1. Dolby Surround Virtualizer"
                     android:textSize="15sp"
                     android:textStyle="bold"
                     android:textColor="#FFFFFF" />
@@ -243,53 +264,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Аппаратный декодер и процессинг Dolby Audio Processing"
-                    android:textSize="12sp"
-                    android:textColor="#9E9E9E" />
-            </LinearLayout>
-
-            <Button
-                android:id="@+id/btnModDolbyAtmos"
-                android:layout_width="110dp"
-                android:layout_height="40dp"
-                android:text="ВЫКЛ"
-                android:textSize="13sp"
-                android:textStyle="bold"
-                android:textColor="#FFFFFF"
-                android:background="@drawable/btn_module_off"
-                android:focusable="true"
-                android:nextFocusUp="@+id/btnPresetAtmos"
-                android:nextFocusDown="@+id/btnModSurroundVirt" />
-        </LinearLayout>
-
-        <!-- 2. Dolby Surround Virtualizer -->
-        <LinearLayout
-            android:layout_width="650dp"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:background="@drawable/card_module_bg"
-            android:padding="10dp"
-            android:layout_marginBottom="8dp">
-
-            <LinearLayout
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="2. Dolby Surround Virtualizer"
-                    android:textSize="15sp"
-                    android:textStyle="bold"
-                    android:textColor="#FFFFFF" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Виртуализация объемного звукового поля Dolby"
+                    android:text="Психоакустическая HRTF-виртуализация каналов Dolby"
                     android:textSize="12sp"
                     android:textColor="#9E9E9E" />
             </LinearLayout>
@@ -304,149 +279,11 @@
                 android:textColor="#FFFFFF"
                 android:background="@drawable/btn_module_off"
                 android:focusable="true"
-                android:nextFocusUp="@+id/btnModDolbyAtmos"
-                android:nextFocusDown="@+id/btnModVolumeLeveler" />
-        </LinearLayout>
-
-        <!-- 3. Dolby Volume Leveler -->
-        <LinearLayout
-            android:layout_width="650dp"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:background="@drawable/card_module_bg"
-            android:padding="10dp"
-            android:layout_marginBottom="8dp">
-
-            <LinearLayout
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="3. Dolby Volume Leveler"
-                    android:textSize="15sp"
-                    android:textStyle="bold"
-                    android:textColor="#FFFFFF" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Автовыравнивание громкости и защита от перепадов"
-                    android:textSize="12sp"
-                    android:textColor="#9E9E9E" />
-            </LinearLayout>
-
-            <Button
-                android:id="@+id/btnModVolumeLeveler"
-                android:layout_width="110dp"
-                android:layout_height="40dp"
-                android:text="ВЫКЛ"
-                android:textSize="13sp"
-                android:textStyle="bold"
-                android:textColor="#FFFFFF"
-                android:background="@drawable/btn_module_off"
-                android:focusable="true"
-                android:nextFocusUp="@+id/btnModSurroundVirt"
-                android:nextFocusDown="@+id/btnModDialogEnhancer" />
-        </LinearLayout>
-
-        <!-- 4. Dolby Dialogue Enhancer -->
-        <LinearLayout
-            android:layout_width="650dp"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:background="@drawable/card_module_bg"
-            android:padding="10dp"
-            android:layout_marginBottom="8dp">
-
-            <LinearLayout
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="4. Dolby Dialogue Enhancer"
-                    android:textSize="15sp"
-                    android:textStyle="bold"
-                    android:textColor="#FFFFFF" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Выделение и повышение четкости речи в фильмах"
-                    android:textSize="12sp"
-                    android:textColor="#9E9E9E" />
-            </LinearLayout>
-
-            <Button
-                android:id="@+id/btnModDialogEnhancer"
-                android:layout_width="110dp"
-                android:layout_height="40dp"
-                android:text="ВЫКЛ"
-                android:textSize="13sp"
-                android:textStyle="bold"
-                android:textColor="#FFFFFF"
-                android:background="@drawable/btn_module_off"
-                android:focusable="true"
-                android:nextFocusUp="@+id/btnModVolumeLeveler"
-                android:nextFocusDown="@+id/btnModBassEnhance" />
-        </LinearLayout>
-
-        <!-- 5. MediaTek Bass Enhancement -->
-        <LinearLayout
-            android:layout_width="650dp"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:background="@drawable/card_module_bg"
-            android:padding="10dp"
-            android:layout_marginBottom="8dp">
-
-            <LinearLayout
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="5. MediaTek Bass Enhancement"
-                    android:textSize="15sp"
-                    android:textStyle="bold"
-                    android:textColor="#FFFFFF" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Глубокий бас и расширение низких частот FusionSound"
-                    android:textSize="12sp"
-                    android:textColor="#9E9E9E" />
-            </LinearLayout>
-
-            <Button
-                android:id="@+id/btnModBassEnhance"
-                android:layout_width="110dp"
-                android:layout_height="40dp"
-                android:text="ВЫКЛ"
-                android:textSize="13sp"
-                android:textStyle="bold"
-                android:textColor="#FFFFFF"
-                android:background="@drawable/btn_module_off"
-                android:focusable="true"
-                android:nextFocusUp="@+id/btnModDialogEnhancer"
+                android:nextFocusUp="@+id/btnPresetAtmos"
                 android:nextFocusDown="@+id/btnModDtsVirtX" />
         </LinearLayout>
 
-        <!-- 6. DTS Virtual:X -->
+        <!-- 1.2 DTS Virtual:X -->
         <LinearLayout
             android:layout_width="650dp"
             android:layout_height="wrap_content"
@@ -465,7 +302,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="6. DTS Virtual:X"
+                    android:text="2. DTS Virtual:X"
                     android:textSize="15sp"
                     android:textStyle="bold"
                     android:textColor="#FFFFFF" />
@@ -473,7 +310,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Трехмерное иммерсивное звуковое поле DTS"
+                    android:text="Фирменное иммерсивное 3D-звуковое поле DTS"
                     android:textSize="12sp"
                     android:textColor="#9E9E9E" />
             </LinearLayout>
@@ -488,11 +325,11 @@
                 android:textColor="#FFFFFF"
                 android:background="@drawable/btn_module_off"
                 android:focusable="true"
-                android:nextFocusUp="@+id/btnModBassEnhance"
+                android:nextFocusUp="@+id/btnModSurroundVirt"
                 android:nextFocusDown="@+id/btnModDtsSurround" />
         </LinearLayout>
 
-        <!-- 7. DTS Studio Surround -->
+        <!-- 1.3 DTS Studio Surround -->
         <LinearLayout
             android:layout_width="650dp"
             android:layout_height="wrap_content"
@@ -511,7 +348,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="7. DTS Studio Surround"
+                    android:text="3. DTS Studio Surround"
                     android:textSize="15sp"
                     android:textStyle="bold"
                     android:textColor="#FFFFFF" />
@@ -519,7 +356,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Эмуляция многоканального студийного окружения"
+                    android:text="Эмуляция многоканального студийного окружения DTS"
                     android:textSize="12sp"
                     android:textColor="#9E9E9E" />
             </LinearLayout>
@@ -538,7 +375,7 @@
                 android:nextFocusDown="@+id/btnModDbxSurround" />
         </LinearLayout>
 
-        <!-- 8. DBX-tv Total Surround -->
+        <!-- 1.4 DBX-tv Total Surround -->
         <LinearLayout
             android:layout_width="650dp"
             android:layout_height="wrap_content"
@@ -557,7 +394,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="8. DBX-tv Total Surround"
+                    android:text="4. DBX-tv Total Surround"
                     android:textSize="15sp"
                     android:textStyle="bold"
                     android:textColor="#FFFFFF" />
@@ -565,7 +402,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Психоакустическое расширение сцены That Corp"
+                    android:text="Психоакустическое расширение панорамы That Corporation"
                     android:textSize="12sp"
                     android:textColor="#9E9E9E" />
             </LinearLayout>
@@ -581,56 +418,10 @@
                 android:background="@drawable/btn_module_off"
                 android:focusable="true"
                 android:nextFocusUp="@+id/btnModDtsSurround"
-                android:nextFocusDown="@+id/btnModDbxSonic" />
-        </LinearLayout>
-
-        <!-- 9. DBX-tv Total Sonic -->
-        <LinearLayout
-            android:layout_width="650dp"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:background="@drawable/card_module_bg"
-            android:padding="10dp"
-            android:layout_marginBottom="8dp">
-
-            <LinearLayout
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="9. DBX-tv Total Sonic"
-                    android:textSize="15sp"
-                    android:textStyle="bold"
-                    android:textColor="#FFFFFF" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Динамический спектральный эквалайзер и коррекция АЧХ"
-                    android:textSize="12sp"
-                    android:textColor="#9E9E9E" />
-            </LinearLayout>
-
-            <Button
-                android:id="@+id/btnModDbxSonic"
-                android:layout_width="110dp"
-                android:layout_height="40dp"
-                android:text="ВЫКЛ"
-                android:textSize="13sp"
-                android:textStyle="bold"
-                android:textColor="#FFFFFF"
-                android:background="@drawable/btn_module_off"
-                android:focusable="true"
-                android:nextFocusUp="@+id/btnModDbxSurround"
                 android:nextFocusDown="@+id/btnModSonicEmotion" />
         </LinearLayout>
 
-        <!-- 10. Sonic Emotion Absolute 3D -->
+        <!-- 1.5 Sonic Emotion 3D -->
         <LinearLayout
             android:layout_width="650dp"
             android:layout_height="wrap_content"
@@ -649,7 +440,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="10. Sonic Emotion 3D"
+                    android:text="5. Sonic Emotion 3D"
                     android:textSize="15sp"
                     android:textStyle="bold"
                     android:textColor="#FFFFFF" />
@@ -657,7 +448,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Алгоритм Absolute 3D для создания широкой панорамы"
+                    android:text="Синтез волнового 3D-поля (WFS) для широкой зоны sweet-spot"
                     android:textSize="12sp"
                     android:textColor="#9E9E9E" />
             </LinearLayout>
@@ -672,7 +463,277 @@
                 android:textColor="#FFFFFF"
                 android:background="@drawable/btn_module_off"
                 android:focusable="true"
-                android:nextFocusUp="@+id/btnModDbxSonic" />
+                android:nextFocusUp="@+id/btnModDbxSurround"
+                android:nextFocusDown="@+id/btnModDolbyAtmos" />
+        </LinearLayout>
+
+        <!-- ============================================================ -->
+        <!-- CATEGORY 2: CORE DOLBY DSP DECODER (INDEPENDENT)              -->
+        <!-- ============================================================ -->
+        <TextView
+            android:layout_width="650dp"
+            android:layout_height="wrap_content"
+            android:text="⚙️ 2. БАЗОВЫЙ ДЕКОДЕР DOLBY (CORE DSP)"
+            android:textColor="#FFD700"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="2dp" />
+
+        <TextView
+            android:layout_width="650dp"
+            android:layout_height="wrap_content"
+            android:text="Лицензированный декодер метаданных Dolby. Совместим со всеми модулями."
+            android:textColor="#888888"
+            android:textSize="12sp"
+            android:layout_marginBottom="10dp" />
+
+        <!-- 2.1 Dolby Atmos DAP -->
+        <LinearLayout
+            android:layout_width="650dp"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="@drawable/card_module_bg"
+            android:padding="10dp"
+            android:layout_marginBottom="16dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="6. Dolby Atmos (DAP)"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="#FFFFFF" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Аппаратный мастер-декодер и процессинг Dolby Audio Processing"
+                    android:textSize="12sp"
+                    android:textColor="#9E9E9E" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/btnModDolbyAtmos"
+                android:layout_width="110dp"
+                android:layout_height="40dp"
+                android:text="ВЫКЛ"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:textColor="#FFFFFF"
+                android:background="@drawable/btn_module_off"
+                android:focusable="true"
+                android:nextFocusUp="@+id/btnModSonicEmotion"
+                android:nextFocusDown="@+id/btnModBassEnhance" />
+        </LinearLayout>
+
+        <!-- ============================================================ -->
+        <!-- CATEGORY 3: ENHANCEMENTS (ALL CAN BE ENABLED TOGETHER)       -->
+        <!-- ============================================================ -->
+        <TextView
+            android:layout_width="650dp"
+            android:layout_height="wrap_content"
+            android:text="🚀 3. УЛУЧШЕНИЯ ЗВУЧАНИЯ (МОЖНО ВКЛЮЧИТЬ ВСЕ)"
+            android:textColor="#00E676"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="2dp" />
+
+        <TextView
+            android:layout_width="650dp"
+            android:layout_height="wrap_content"
+            android:text="Бас, четкость речи и коррекция АЧХ. Не конфликтуют и работают одновременно."
+            android:textColor="#888888"
+            android:textSize="12sp"
+            android:layout_marginBottom="10dp" />
+
+        <!-- 3.1 MediaTek Bass Enhancement -->
+        <LinearLayout
+            android:layout_width="650dp"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="@drawable/card_module_bg"
+            android:padding="10dp"
+            android:layout_marginBottom="8dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="7. MediaTek Bass Enhancement"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="#FFFFFF" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Синтезатор субгармоник низких частот FusionSound"
+                    android:textSize="12sp"
+                    android:textColor="#9E9E9E" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/btnModBassEnhance"
+                android:layout_width="110dp"
+                android:layout_height="40dp"
+                android:text="ВЫКЛ"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:textColor="#FFFFFF"
+                android:background="@drawable/btn_module_off"
+                android:focusable="true"
+                android:nextFocusUp="@+id/btnModDolbyAtmos"
+                android:nextFocusDown="@+id/btnModDialogEnhancer" />
+        </LinearLayout>
+
+        <!-- 3.2 Dolby Dialogue Enhancer -->
+        <LinearLayout
+            android:layout_width="650dp"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="@drawable/card_module_bg"
+            android:padding="10dp"
+            android:layout_marginBottom="8dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="8. Dolby Dialogue Enhancer"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="#FFFFFF" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Выделение формант человеческой речи и разборчивость голоса"
+                    android:textSize="12sp"
+                    android:textColor="#9E9E9E" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/btnModDialogEnhancer"
+                android:layout_width="110dp"
+                android:layout_height="40dp"
+                android:text="ВЫКЛ"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:textColor="#FFFFFF"
+                android:background="@drawable/btn_module_off"
+                android:focusable="true"
+                android:nextFocusUp="@+id/btnModBassEnhance"
+                android:nextFocusDown="@+id/btnModVolumeLeveler" />
+        </LinearLayout>
+
+        <!-- 3.3 Dolby Volume Leveler -->
+        <LinearLayout
+            android:layout_width="650dp"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="@drawable/card_module_bg"
+            android:padding="10dp"
+            android:layout_marginBottom="8dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="9. Dolby Volume Leveler"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="#FFFFFF" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Ночной режим: автовыравнивание громкости и сглаживание перепадов"
+                    android:textSize="12sp"
+                    android:textColor="#9E9E9E" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/btnModVolumeLeveler"
+                android:layout_width="110dp"
+                android:layout_height="40dp"
+                android:text="ВЫКЛ"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:textColor="#FFFFFF"
+                android:background="@drawable/btn_module_off"
+                android:focusable="true"
+                android:nextFocusUp="@+id/btnModDialogEnhancer"
+                android:nextFocusDown="@+id/btnModDbxSonic" />
+        </LinearLayout>
+
+        <!-- 3.4 DBX-tv Total Sonic -->
+        <LinearLayout
+            android:layout_width="650dp"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="@drawable/card_module_bg"
+            android:padding="10dp"
+            android:layout_marginBottom="24dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="10. DBX-tv Total Sonic"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="#FFFFFF" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Интеллектуальная коррекция АЧХ и компенсация резонансов ТВ"
+                    android:textSize="12sp"
+                    android:textColor="#9E9E9E" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/btnModDbxSonic"
+                android:layout_width="110dp"
+                android:layout_height="40dp"
+                android:text="ВЫКЛ"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:textColor="#FFFFFF"
+                android:background="@drawable/btn_module_off"
+                android:focusable="true"
+                android:nextFocusUp="@+id/btnModVolumeLeveler" />
         </LinearLayout>
 
     </LinearLayout>

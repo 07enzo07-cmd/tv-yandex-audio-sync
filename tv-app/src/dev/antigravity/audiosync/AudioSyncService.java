@@ -164,13 +164,13 @@ public class AudioSyncService extends Service {
                 lastEventsQueryTime = now - 5000L; // Overlap by 5s
 
                 if (currentForegroundPkg.contains("twitch")) {
-                    baseDelay = 80; // Twitch live stream low-latency mode (80 ms)
+                    baseDelay = 60; // Twitch live stream low-latency mode (60 ms)
                 } else if (currentForegroundPkg.contains("watch.kino") || currentForegroundPkg.contains("kinopub")) {
-                    baseDelay = 150; // Kinopub multichannel 5.1 stream mode (150 ms)
+                    baseDelay = 60; // Kinopub native stream mode (60 ms)
                 } else if (currentForegroundPkg.contains("spotify")) {
-                    baseDelay = 150; // Spotify audio streaming mode (150 ms)
+                    baseDelay = 60; // Spotify audio streaming mode (60 ms)
                 } else {
-                    baseDelay = 160; // YouTube / other media players (160 ms)
+                    baseDelay = 140; // YouTube / other media players (140 ms)
                 }
             } catch (Exception e) {
                 Log.w(TAG, "detectOptimalDelay error: " + e.getMessage());

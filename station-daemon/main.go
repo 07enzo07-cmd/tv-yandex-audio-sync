@@ -173,10 +173,10 @@ func main() {
 	updatePrebuffer := func(totalDelay int) {
 		var q int
 		if totalDelay <= 100 {
-			// Ultra low-latency mode (Twitch 70-80ms -> 1-2 chunks = 10-20 ms Go buffer):
-			q = (totalDelay - 60) / 10
+			// Ultra low-latency / non-tunneled mode (Spotify/Kinopub/Twitch 60ms -> 1 chunk = 10 ms Go buffer):
+			q = (totalDelay - 50) / 10
 		} else {
-			// Calibrated media mode (Kinopub/Spotify 140-150ms -> 5-6 chunks, YouTube 160ms -> 7 chunks):
+			// Tunneled 4K video mode (YouTube 140ms -> 5 chunks = 50 ms Go buffer):
 			q = (totalDelay - 90) / 10
 		}
 		if q < 1 {

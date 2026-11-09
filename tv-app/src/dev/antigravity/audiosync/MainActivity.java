@@ -31,26 +31,33 @@ public class MainActivity extends Activity {
         final int buttonId;
         final String settingKey;
         final String name;
+        final int category; // 1 = SPATIAL (exclusive 1 of 5), 2 = CORE (independent), 3 = ENHANCEMENT (all can be on)
         Button button;
 
-        SoundModule(int buttonId, String settingKey, String name) {
+        SoundModule(int buttonId, String settingKey, String name, int category) {
             this.buttonId = buttonId;
             this.settingKey = settingKey;
             this.name = name;
+            this.category = category;
         }
     }
 
     private final SoundModule[] soundModules = new SoundModule[] {
-        new SoundModule(R.id.btnModDolbyAtmos, "sound_advanced_dolby_atmos", "Dolby Atmos"),
-        new SoundModule(R.id.btnModSurroundVirt, "sound_advanced_surround_virtualizer", "Surround Virtualizer"),
-        new SoundModule(R.id.btnModVolumeLeveler, "sound_advanced_volume_leveler", "Volume Leveler"),
-        new SoundModule(R.id.btnModDialogEnhancer, "sound_advanced_dialogue_enhancer", "Dialogue Enhancer"),
-        new SoundModule(R.id.btnModBassEnhance, "sound_bass_enhancement", "Bass Enhancement"),
-        new SoundModule(R.id.btnModDtsVirtX, "sound_dts_virtual_x", "DTS Virtual:X"),
-        new SoundModule(R.id.btnModDtsSurround, "sound_dts_studio_surround", "DTS Studio Surround"),
-        new SoundModule(R.id.btnModDbxSurround, "sound_dbx_total_surround", "DBX Total Surround"),
-        new SoundModule(R.id.btnModDbxSonic, "sound_dbx_total_sonic", "DBX Total Sonic"),
-        new SoundModule(R.id.btnModSonicEmotion, "sound_sonic_emotion", "Sonic Emotion 3D")
+        // Категория 1: Пространственное звучание 3D (ВКЛЮЧАЕТСЯ ТОЛЬКО ОДИН ИЗ 5)
+        new SoundModule(R.id.btnModSurroundVirt, "sound_advanced_surround_virtualizer", "Dolby Surround Virtualizer", 1),
+        new SoundModule(R.id.btnModDtsVirtX, "sound_dts_virtual_x", "DTS Virtual:X", 1),
+        new SoundModule(R.id.btnModDtsSurround, "sound_dts_studio_surround", "DTS Studio Surround", 1),
+        new SoundModule(R.id.btnModDbxSurround, "sound_dbx_total_surround", "DBX Total Surround", 1),
+        new SoundModule(R.id.btnModSonicEmotion, "sound_sonic_emotion", "Sonic Emotion 3D", 1),
+
+        // Категория 2: Базовый декодер Dolby (Core DSP)
+        new SoundModule(R.id.btnModDolbyAtmos, "sound_advanced_dolby_atmos", "Dolby Atmos (DAP)", 2),
+
+        // Категория 3: Улучшения звучания (МОЖНО ВКЛЮЧАТЬ ВСЕ ОДНОВРЕМЕННО)
+        new SoundModule(R.id.btnModBassEnhance, "sound_bass_enhancement", "Bass Enhancement", 3),
+        new SoundModule(R.id.btnModDialogEnhancer, "sound_advanced_dialogue_enhancer", "Dialogue Enhancer", 3),
+        new SoundModule(R.id.btnModVolumeLeveler, "sound_advanced_volume_leveler", "Volume Leveler", 3),
+        new SoundModule(R.id.btnModDbxSonic, "sound_dbx_total_sonic", "DBX Total Sonic", 3)
     };
 
     @Override
@@ -110,11 +117,17 @@ public class MainActivity extends Activity {
             btnPresetAtmos.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View v) {
+                    // Turn on Dolby Surround Virtualizer, turn off all competing 3D virtualizers
+                    for (SoundModule m : soundModules) {
+                        if (m.category == 1) {
+                            setGlobalAudioSetting(m.settingKey, m.buttonId == R.id.btnModSurroundVirt ? 1 : 0);
+                        }
+                    }
                     setGlobalAudioSetting("sound_advanced_dolby_atmos", 1);
-                    setGlobalAudioSetting("sound_advanced_surround_virtualizer", 1);
                     setGlobalAudioSetting("sound_bass_enhancement", 1);
+                    setGlobalAudioSetting("sound_advanced_dialogue_enhancer", 1);
                     updateAllSoundModuleButtons();
-                    Toast.makeText(MainActivity.this, "Включен набор: Atmos + Virtualizer + Bass", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(MainActivity.this, "Включен набор: Atmos + Virtualizer + Bass + Речь", Toast.LENGTH_SHORT).show();
                 }
             });
         }
@@ -175,11 +188,32 @@ public class MainActivity extends Activity {
                     @Override
                     public void onClick(View v) {
                         int currentVal = getGlobalAudioSetting(mod.settingKey, 0);
-                        int newVal = currentVal == 1 ? 0 : 1;
-                        setGlobalAudioSetting(mod.settingKey, newVal);
-                        updateModuleButtonState(mod);
-                        String stateStr = newVal == 1 ? "ВКЛЮЧЕН" : "ВЫКЛЮЧЕН";
-                        Toast.makeText(MainActivity.this, mod.name + ": " + stateStr, Toast.LENGTH_SHORT).show();
+                        if (mod.category == 1) {
+                            if (currentVal == 1) {
+                                // Turn OFF -> regular stereo
+                                setGlobalAudioSetting(mod.settingKey, 0);
+                                updateModuleButtonState(mod);
+                                Toast.makeText(MainActivity.this, mod.name + ": ВЫКЛ (обычное стерео)", Toast.LENGTH_SHORT).show();
+                            } else {
+                                // Turn ON -> disable all competing 3D virtualizers
+                                for (SoundModule other : soundModules) {
+                                    if (other.category == 1 && other != mod) {
+                                        setGlobalAudioSetting(other.settingKey, 0);
+                                        updateModuleButtonState(other);
+                                    }
+                                }
+                                setGlobalAudioSetting(mod.settingKey, 1);
+                                updateModuleButtonState(mod);
+                                Toast.makeText(MainActivity.this, mod.name + ": ВКЛ (остальные 3D-модули отключены)", Toast.LENGTH_SHORT).show();
+                            }
+                        } else {
+                            // Category 2 & 3: independent toggles
+                            int newVal = currentVal == 1 ? 0 : 1;
+                            setGlobalAudioSetting(mod.settingKey, newVal);
+                            updateModuleButtonState(mod);
+                            String stateStr = newVal == 1 ? "ВКЛЮЧЕН" : "ВЫКЛЮЧЕН";
+                            Toast.makeText(MainActivity.this, mod.name + ": " + stateStr, Toast.LENGTH_SHORT).show();
+                        }
                     }
                 });
             }
@@ -242,7 +276,7 @@ public class MainActivity extends Activity {
         AudioSyncService.globalDelayOffsetMs = currentOffset;
         String sign = currentOffset > 0 ? "+" : "";
         if (tvDelayInfo != null) {
-            tvDelayInfo.setText("Смещение: " + sign + currentOffset + " мс (YouTube: " + (160 + currentOffset) + " мс, Кинопаб: " + (150 + currentOffset) + " мс, Spotify: " + (150 + currentOffset) + " мс, Twitch: " + (80 + currentOffset) + " мс)");
+            tvDelayInfo.setText("Смещение: " + sign + currentOffset + " мс (YouTube: " + (140 + currentOffset) + " мс, Кинопаб: " + (60 + currentOffset) + " мс, Spotify: " + (60 + currentOffset) + " мс, Twitch: " + (60 + currentOffset) + " мс)");
         }
     }
 
