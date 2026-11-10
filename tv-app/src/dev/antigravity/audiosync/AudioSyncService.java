@@ -186,6 +186,7 @@ public class AudioSyncService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        enforceDefaultDspProfile();
         android.content.SharedPreferences prefs = getSharedPreferences("audiosync", Context.MODE_PRIVATE);
         globalDelayOffsetMs = prefs.getInt("delay_offset", 0);
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
@@ -623,4 +624,22 @@ public class AudioSyncService extends Service {
     public IBinder onBind(Intent intent) {
         return null;
     }
+
+    private void enforceDefaultDspProfile() {
+        try {
+            android.content.ContentResolver cr = getContentResolver();
+            // Обязательные включённые модули по умолчанию:
+            android.provider.Settings.Global.putInt(cr, "sound_advanced_surround_virtualizer", 1);
+            android.provider.Settings.Global.putInt(cr, "sound_advanced_dolby_atmos", 1);
+            android.provider.Settings.Global.putInt(cr, "sound_bass_enhancement", 1);
+            // Отключаем конфликтующие виртуализаторы и буферизующие лимитеры:
+            android.provider.Settings.Global.putInt(cr, "sound_dts_virtual_x", 0);
+            android.provider.Settings.Global.putInt(cr, "sound_dts_studio_surround", 0);
+            android.provider.Settings.Global.putInt(cr, "sound_dbx_total_surround", 0);
+            android.provider.Settings.Global.putInt(cr, "sound_sonic_emotion", 0);
+            android.provider.Settings.Global.putInt(cr, "sound_auto_volume_leveling", 0);
+            android.provider.Settings.Global.putInt(cr, "sound_dts_limiter", 0);
+        } catch (Throwable ignored) {}
+    }
+
 }
