@@ -163,15 +163,34 @@ public class AudioSyncService extends Service {
                 }
                 lastEventsQueryTime = now - 5000L; // Overlap by 5s
 
+                String profileKey = "youtube";
                 if (currentForegroundPkg.contains("twitch")) {
-                    baseDelay = 80; // Twitch live stream low-latency mode (80 ms)
+                    profileKey = "twitch";
+                    baseDelay = 70; // Twitch live stream low-latency mode (70 ms)
                 } else if (currentForegroundPkg.contains("watch.kino") || currentForegroundPkg.contains("kinopub")) {
+                    profileKey = "kinopub";
                     baseDelay = 150; // Kinopub native stream mode (150 ms)
                 } else if (currentForegroundPkg.contains("spotify")) {
-                    baseDelay = 150; // Spotify audio streaming mode (150 ms)
+                    profileKey = "spotify";
+                    baseDelay = 40; // Spotify audio streaming mode (40 ms: pure audio without VOD display lag)
                 } else {
-                    baseDelay = 150; // YouTube / other media players (150 ms)
+                    profileKey = "youtube";
+                    baseDelay = 150; // YouTube / Kinopoisk / other media players (150 ms)
                 }
+
+                if ("spotify".equals(profileKey)) {
+                    applySpeakerDelay(95); // Delay TV speakers by 95ms to achieve <5ms acoustic sync with Station
+                } else {
+                    applySpeakerDelay(0);  // Zero delay for YouTube, Kinopoisk, Twitch (handled by A/V sync)
+                }
+
+                try {
+                    int customDelay = android.provider.Settings.Global.getInt(
+                            getContentResolver(), "vivax_audio_delay_" + profileKey, -1);
+                    if (customDelay >= 40 && customDelay <= 1200) {
+                        baseDelay = customDelay;
+                    }
+                } catch (Exception ignored) {}
             } catch (Exception e) {
                 Log.w(TAG, "detectOptimalDelay error: " + e.getMessage());
             }
@@ -511,7 +530,7 @@ public class AudioSyncService extends Service {
                             bb.putInt(0x53594E43); // 'SYNC' magic
                             bb.putInt((int) packetCount);
                             bb.putInt((int) (SystemClock.elapsedRealtime() & 0xFFFFFFFFL));
-                            bb.put((byte) currentTvVolume);
+                            bb.put((byte) ((currentTvVolume & 0x7F) | 0x80)); // bit 7: shortPipe (4096B F_SETPIPE_SZ)
                             bb.put((byte) currentStationVolume);
                             bb.put((byte) (currentIsMuted ? 1 : 0));
                             bb.put((byte) (currentTargetDelayMs / 10)); // Dynamic Target Delay from TV!
@@ -573,6 +592,7 @@ public class AudioSyncService extends Service {
     }
 
     private synchronized void stopStreaming() {
+        applySpeakerDelay(0);
         isCapturing = false;
         isRunning = false;
         currentIp = "";
@@ -640,6 +660,23 @@ public class AudioSyncService extends Service {
             android.provider.Settings.Global.putInt(cr, "sound_auto_volume_leveling", 0);
             android.provider.Settings.Global.putInt(cr, "sound_dts_limiter", 0);
         } catch (Throwable ignored) {}
+    }
+
+    private int currentSpeakerDelay = -1;
+
+    private void applySpeakerDelay(int delayMs) {
+        if (currentSpeakerDelay != delayMs) {
+            currentSpeakerDelay = delayMs;
+            try {
+                if (audioManager != null) {
+                    audioManager.setParameters("speaker_audio_delay=" + delayMs);
+                }
+                android.provider.Settings.Global.putInt(getContentResolver(), "sound_speaker_delay", delayMs);
+                Log.i(TAG, "Applied speaker_audio_delay=" + delayMs + " ms");
+            } catch (Throwable t) {
+                Log.w(TAG, "Failed to apply speaker_audio_delay: " + t.getMessage());
+            }
+        }
     }
 
 }
