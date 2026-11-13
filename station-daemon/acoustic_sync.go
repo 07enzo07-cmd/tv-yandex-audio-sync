@@ -47,8 +47,8 @@ const (
 	nlmsEps       = 1e-4
 
 	// FFT size for GCC-PHAT cross-correlation:
-	// N = 16384 samples at 16 kHz = 1024 ms analysis window (covers lags up to ±512 ms).
-	fftSize = 16384
+	// N = 32768 samples at 16 kHz = 2048 ms analysis window (covers lags up to ±1024 ms).
+	fftSize = 32768
 )
 
 type AcousticResult struct {
@@ -518,8 +518,8 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 			minSpkSample = 480
 		}
 		maxSpkSample := int((expectedStationDelayMs + 35.0) * 16.0)
-		if maxSpkSample > 7680 {
-			maxSpkSample = 7680
+		if maxSpkSample > fftSize/2 {
+			maxSpkSample = fftSize / 2
 		}
 		var maxSpk, sumSpk float64
 		var countSpk int
@@ -583,23 +583,22 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 			ae.fftCorr[fftSize-k] = complex(real(ae.fftCorr[k]), -imag(ae.fftCorr[k]))
 		}
 		fftInPlace(ae.fftCorr, true)
-		for s := 0; s <= 7680; s++ {
+		for s := 0; s < fftSize/2; s++ {
 			ae.corrMag[s] += math.Abs(real(ae.fftCorr[s])) * 0.25
 		}
 	}
 
-	// Blank narrow chassis direct coupling (±1.5 ms = ±24 samples around Station direct speaker).
-	// With 1024-tap NLMS active, Station's own sound and table reflections are cancelled in micCleanRing.
+	// Blank narrow chassis direct coupling (±3.0 ms = ±48 samples around Station direct speaker).
+	// With 64-tap NLMS active, Station's own sound is cancelled in micCleanRing, but blanking avoids edge leakage.
 	spkCenterSample := int(math.Round(res.SpkLagMs * 16.0))
-	spkBlankRadius := 24
+	spkBlankRadius := 48
 
-	// Physical corridor for TV arrival at Station microphones:
-	// With Station on the couch (soft upholstery, ~2.4 m distance from TV):
-	// Direct acoustic time of flight is ~7.0 ms.
-	// TV MediaTek Audio HAL + Dolby Atmos DSP latency is ~140..160 ms.
-	// Total physical TV acoustic arrival window is 70 ms .. 280 ms.
-	minSearchSample := int(70.0 * 16.0)  // 70 ms = 1120 samples (eliminates <70 ms chassis/noise floor)
-	maxSearchSample := int(280.0 * 16.0) // 280 ms = 4480 samples
+	// Wide physical corridor for TV arrival at Station microphones:
+	// - Pure audio apps (Spotify): ~120..150 ms
+	// - TV Video players (YouTube, ExoPlayer, Kinopoisk): 380..450 ms (256 ms track buffer + 163 ms HAL latency)
+	// - Broad search corridor: 70 ms .. 750 ms covers ALL known Android TV apps without artificial blindness.
+	minSearchSample := int(70.0 * 16.0)  // 70 ms = 1120 samples
+	maxSearchSample := int(750.0 * 16.0) // 750 ms = 12000 samples
 
 	var maxTv float64
 	bestTvSample := -1
@@ -635,13 +634,13 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 		return res
 	}
 
-	// Peak-to-sidelobe ratio (PSR): require PSR >= 5.0 for valid lock
+	// Peak-to-sidelobe ratio (PSR): require PSR >= 4.5 for valid lock
 	psr := maxTv / meanBg
 	res.TvConf = psr / 10.0
 	if res.TvConf > 1.0 {
 		res.TvConf = 1.0
 	}
-	if psr < 5.0 {
+	if psr < 4.5 {
 		return res
 	}
 
@@ -664,7 +663,10 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 	}
 
 	res.TvLagMs = float64(bestTvSample) * 1000.0 / float64(decimRate)
-	res.AcousticErr = (res.TvLagMs - geomAirMs) - res.SpkLagMs
+	// True physical room acoustic mismatch at the listener's position on the couch:
+	// Sound from TV arrives at couch at TvLagMs. Sound from Station arrives at couch at SpkLagMs.
+	// When AcousticErr = 0, sound waves hit listener's ears at the exact same instant!
+	res.AcousticErr = res.TvLagMs - res.SpkLagMs
 	res.Valid = true
 
 	atomic.StoreInt64(&ae.lastTvLagTenthsMs, int64(math.Round(res.TvLagMs*10)))

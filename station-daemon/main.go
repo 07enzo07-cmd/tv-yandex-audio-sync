@@ -31,13 +31,13 @@ const (
 	// which provides a rock-solid 48 ms jitter cushion with 0 stalls, 0 drops, and 0 underruns,
 	// while naturally matching the TV's acoustic latency (MediaTek Audio HAL + Dolby Atmos + air travel).
 	alsaBaseMs   = 100.0
-	minStationMs = 125  // Physical minimum stable latency of Station (2.5 chunks Go queue)
-	maxStationMs = 350  // Maximum allowed Station buffer delay
+	minStationMs = 100  // Physical minimum stable latency of Station (0 chunks Go queue + 100 ms ALSA/pipe)
+	maxStationMs = 700  // Maximum allowed Station buffer delay (supports video audio pipelines up to 700 ms)
 	geomAirMs    = 7.0  // Acoustic time-of-flight from TV to Station microphones (~2.4 meters)
 )
 
 func getInitialDelayMs() int {
-	target := 148 // Calibrated default matching natural TV acoustic latency
+	target := 400 // Default matching TV video player latency (YouTube / ExoPlayer ~400 ms)
 	data, err := os.ReadFile("/data/audiosync/delay_ms")
 	if err == nil {
 		str := strings.TrimSpace(string(data))
@@ -434,10 +434,16 @@ func main() {
 			if confirmCount >= 3 {
 				confirmCount = 0
 				deltaMs := int(math.Round(smoothedErr * 0.50))
-				if deltaMs > 10 {
-					deltaMs = 10
-				} else if deltaMs < -10 {
-					deltaMs = -10
+				maxStep := 15
+				if math.Abs(smoothedErr) > 60.0 {
+					maxStep = 50
+				} else if math.Abs(smoothedErr) > 30.0 {
+					maxStep = 30
+				}
+				if deltaMs > maxStep {
+					deltaMs = maxStep
+				} else if deltaMs < -maxStep {
+					deltaMs = -maxStep
 				}
 
 				newStationMs := curStationMs + deltaMs
@@ -531,20 +537,20 @@ func main() {
 					var desiredStationMs int
 					var desiredTvSpkMs int
 					switch appHint {
-					case 1, 15: // YouTube / generic video
+					case 1, 15: // YouTube / generic video (ExoPlayer has ~400 ms AudioTrack + HAL latency)
+						desiredStationMs = 400
+						desiredTvSpkMs = 0
+					case 2, 12: // Spotify pure audio (low-latency AudioTrack ~148 ms)
 						desiredStationMs = 148
 						desiredTvSpkMs = 0
-					case 2, 12: // Spotify pure audio
-						desiredStationMs = 148
-						desiredTvSpkMs = 0
-					case 3, 7: // Twitch low latency
+					case 3, 7: // Twitch low latency (~135 ms)
 						desiredStationMs = 135
 						desiredTvSpkMs = 0
-					case 4, 40, 14: // Kinopoisk / Kinopub video
-						desiredStationMs = 148
+					case 4, 40, 14: // Kinopoisk / Kinopub video (ExoPlayer ~400 ms)
+						desiredStationMs = 400
 						desiredTvSpkMs = 0
 					default:
-						if appHint >= 10 && appHint <= 50 {
+						if appHint >= 10 && appHint <= 70 {
 							desiredStationMs = appHint * 10
 						}
 					}
