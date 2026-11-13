@@ -55,10 +55,15 @@ const (
 type AcousticResult struct {
 	SpkLagMs    float64 // Measured lag from UDP arrival (refRing) to Station speaker hardware loopback (TODDR_B)
 	TvLagMs     float64 // Measured lag from UDP arrival (refRing) to TV sound arriving at Station mics
-	AcousticErr float64 // True room mismatch: (TvLagMs - geomOffsetMs) - SpkLagMs (>0 means TV is later than Station)
+	AcousticErr float64 // True room mismatch: TvLagMs - SpkLagMs (>0 means TV is later than Station)
 	SpkConf     float64 // Peak-to-sidelobe confidence of Station loopback
 	TvConf      float64 // Peak-to-sidelobe PSR confidence of TV acoustic arrival
 	Valid       bool
+	Status      string  // "TV_DETECTED", "TV_NOT_DISTINGUISHABLE", "CLEAN_PROBE_TV_LOCKED"
+	SpkMag      float64 // Peak magnitude of Station speaker direct sound
+	TvMag       float64 // Peak magnitude of TV sound
+	TvPsr       float64 // Peak-to-sidelobe ratio (PSR) of TV sound
+	Ratio       float64 // TvMag / SpkMag ratio
 }
 
 type AcousticEstimator struct {
@@ -685,64 +690,97 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 	}
 
 	// 3. Evaluate Room Sync State:
+	ratio := 0.0
+	if spkDirectMag > 1e-6 {
+		ratio = maxTv / spkDirectMag
+	}
+	res.SpkMag = spkDirectMag
+	res.TvMag = maxTv
+	res.TvPsr = psr
+	res.Ratio = ratio
+
+	isTvDistinct := bestTvSample >= 0 && maxTv >= 0.020 && psr >= 4.0
+
 	if spkActive {
-		// When Station speaker is actively playing:
-		// If the strongest peak outside the speaker blanking window is weak relative to the
-		// central speaker peak (maxTv < 0.22 * spkDirectMag) or below noise thresholds,
-		// IT PROVES THE TV ARRIVAL IS COINCIDENT WITH THE STATION SPEAKER AT THE COUCH!
-		// Wavefronts are acoustically fused: zero error, 100% confidence lock!
-		if maxTv < 0.22*spkDirectMag || maxTv < 0.018 || psr < 3.8 {
-			res.TvLagMs = res.SpkLagMs
-			res.AcousticErr = 0.0
-			res.TvConf = 1.0
+		// When Station speaker is actively playing in the room:
+		// Require TV peak to be genuinely distinct:
+		// 1) Absolute magnitude >= 0.020
+		// 2) PSR >= 4.0 (+12 dB above background floor)
+		// 3) Either TV is outside speaker blanking AND has sufficient power relative to leakage (ratio >= 0.25),
+		//    OR Station speaker is very quiet.
+		if isTvDistinct && ratio >= 0.25 {
+			// Direct line-of-sight path selection:
+			directWindowStart := bestTvSample - int(15.0*16.0)
+			if directWindowStart < minSearchSample {
+				directWindowStart = minSearchSample
+			}
+			thresh := 0.75 * maxTv
+			for s := directWindowStart; s < bestTvSample; s++ {
+				if s >= chassisBlankStart && s <= chassisBlankEnd {
+					continue
+				}
+				if ae.corrMag[s] >= thresh && ae.corrMag[s] > ae.corrMag[s-1] && ae.corrMag[s] > ae.corrMag[s+1] {
+					bestTvSample = s
+					maxTv = ae.corrMag[s]
+					break
+				}
+			}
+
+			res.TvLagMs = float64(bestTvSample) * 1000.0 / float64(decimRate)
+			res.AcousticErr = res.TvLagMs - res.SpkLagMs
+			res.TvConf = psr / 10.0
+			if res.TvConf > 1.0 {
+				res.TvConf = 1.0
+			}
 			res.Valid = true
-			atomic.StoreInt64(&ae.lastTvLagTenthsMs, int64(math.Round(res.TvLagMs*10)))
-			atomic.StoreInt64(&ae.lastSpkLagTenthsMs, int64(math.Round(res.SpkLagMs*10)))
-			atomic.StoreInt64(&ae.lastErrTenthsMs, 0)
-			atomic.StoreInt64(&ae.lastConfidence, 1000)
-			return res
+			res.Status = "TV_DETECTED"
+		} else {
+			// TV is NOT distinguishable!
+			// DO NOT FABRICATE ZERO ERROR!
+			res.TvLagMs = float64(bestTvSample) * 1000.0 / float64(decimRate)
+			res.AcousticErr = 0.0
+			res.TvConf = 0.0
+			res.Valid = false
+			res.Status = "TV_NOT_DISTINGUISHABLE"
 		}
 	} else {
-		// Station speaker is silent (Initial Silence Probe):
-		// Require distinct TV acoustic arrival above noise floor
-		if bestTvSample < 0 || maxTv < 0.018 || psr < 3.8 {
-			return res
+		// Station speaker is SILENT (Clean Silence Probe or quiet passage):
+		// No Station speaker loopback interference at all!
+		if isTvDistinct {
+			directWindowStart := bestTvSample - int(15.0*16.0)
+			if directWindowStart < minSearchSample {
+				directWindowStart = minSearchSample
+			}
+			thresh := 0.75 * maxTv
+			for s := directWindowStart; s < bestTvSample; s++ {
+				if ae.corrMag[s] >= thresh && ae.corrMag[s] > ae.corrMag[s-1] && ae.corrMag[s] > ae.corrMag[s+1] {
+					bestTvSample = s
+					maxTv = ae.corrMag[s]
+					break
+				}
+			}
+
+			res.TvLagMs = float64(bestTvSample) * 1000.0 / float64(decimRate)
+			res.AcousticErr = 0.0
+			res.TvConf = psr / 10.0
+			if res.TvConf > 1.0 {
+				res.TvConf = 1.0
+			}
+			res.Valid = true
+			res.Status = "CLEAN_PROBE_TV_LOCKED"
+		} else {
+			res.TvLagMs = float64(bestTvSample) * 1000.0 / float64(decimRate)
+			res.Valid = false
+			res.Status = "TV_NOT_DISTINGUISHABLE"
 		}
 	}
 
-	// 4. Direct line-of-sight path selection:
-	// Room reflections arrive 3-15 ms after the direct line-of-sight path.
-	// If an earlier local peak exists within 15 ms with >= 75% magnitude, pick the direct path!
-	directWindowStart := bestTvSample - int(15.0*16.0)
-	if directWindowStart < minSearchSample {
-		directWindowStart = minSearchSample
+	if res.Valid {
+		atomic.StoreInt64(&ae.lastTvLagTenthsMs, int64(math.Round(res.TvLagMs*10)))
+		atomic.StoreInt64(&ae.lastSpkLagTenthsMs, int64(math.Round(res.SpkLagMs*10)))
+		atomic.StoreInt64(&ae.lastErrTenthsMs, int64(math.Round(res.AcousticErr*10)))
+		atomic.StoreInt64(&ae.lastConfidence, int64(math.Round(res.TvConf*1000)))
 	}
-	thresh := 0.75 * maxTv
-	for s := directWindowStart; s < bestTvSample; s++ {
-		if spkActive && s >= chassisBlankStart && s <= chassisBlankEnd {
-			continue
-		}
-		if ae.corrMag[s] >= thresh && ae.corrMag[s] > ae.corrMag[s-1] && ae.corrMag[s] > ae.corrMag[s+1] {
-			bestTvSample = s
-			maxTv = ae.corrMag[s]
-			break
-		}
-	}
-
-	res.TvLagMs = float64(bestTvSample) * 1000.0 / float64(decimRate)
-	// Physical arrival mismatch at the couch microphones (listener position):
-	// TvLagMs is when TV wavefront hits couch; SpkLagMs is when Station wavefront hits couch.
-	// TvLagMs - SpkLagMs = 0 means simultaneous arrival at the user's ears!
-	res.AcousticErr = res.TvLagMs - res.SpkLagMs
-	res.TvConf = psr / 10.0
-	if res.TvConf > 1.0 {
-		res.TvConf = 1.0
-	}
-	res.Valid = true
-
-	atomic.StoreInt64(&ae.lastTvLagTenthsMs, int64(math.Round(res.TvLagMs*10)))
-	atomic.StoreInt64(&ae.lastSpkLagTenthsMs, int64(math.Round(res.SpkLagMs*10)))
-	atomic.StoreInt64(&ae.lastErrTenthsMs, int64(math.Round(res.AcousticErr*10)))
 	atomic.StoreInt64(&ae.lastConfidence, int64(math.Round(res.TvConf*1000)))
 	return res
 }

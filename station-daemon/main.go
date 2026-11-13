@@ -65,13 +65,86 @@ func getGeomAirMs() float64 {
 	return geomAirMs
 }
 
+func isObservationMode() bool {
+	// If explicit auto_control file exists:
+	// "1", "true", or "closed_loop" -> Observation mode OFF (closed loop active)
+	// "0", "false", or "observe" -> Observation mode ON
+	if data, err := os.ReadFile("/data/audiosync/auto_control"); err == nil {
+		str := strings.TrimSpace(string(data))
+		if str == "1" || strings.EqualFold(str, "true") || strings.EqualFold(str, "closed_loop") {
+			return false
+		}
+		return true
+	}
+	// Default for Phase 1: Observation Mode is ACTIVE (closed-loop adjustment frozen)
+	return true
+}
+
 func isAcousticAutoEnabled() bool {
+	if isObservationMode() {
+		return false
+	}
 	data, err := os.ReadFile("/data/audiosync/acoustic_auto")
 	if err != nil {
 		return true
 	}
 	str := strings.TrimSpace(string(data))
 	return str != "0" && !strings.EqualFold(str, "false")
+}
+
+func checkManualCommands(
+	curStationMs int,
+	setStationDelay func(int),
+	player *Player,
+	acoustic *AcousticEstimator,
+	atomicStationVol *int64,
+) {
+	// 1. Manual Step: /data/audiosync/cmd_step
+	if data, err := os.ReadFile("/data/audiosync/cmd_step"); err == nil {
+		_ = os.Remove("/data/audiosync/cmd_step")
+		str := strings.TrimSpace(string(data))
+		if step, err := strconv.Atoi(str); err == nil {
+			newDelay := curStationMs + step
+			if newDelay < minStationMs {
+				newDelay = minStationMs
+			} else if newDelay > maxStationMs {
+				newDelay = maxStationMs
+			}
+			setStationDelay(newDelay)
+			fmt.Fprintf(os.Stderr, "[diag-cmd] MANUAL STEP APPLIED: step=%+d ms, delay %d -> %d ms\n", step, curStationMs, newDelay)
+		} else {
+			fmt.Fprintf(os.Stderr, "[diag-cmd] MANUAL STEP INVALID: '%s': %v\n", str, err)
+		}
+	}
+
+	// 2. Clean Probe: /data/audiosync/cmd_probe
+	if _, err := os.Stat("/data/audiosync/cmd_probe"); err == nil {
+		_ = os.Remove("/data/audiosync/cmd_probe")
+		fmt.Fprintf(os.Stderr, "[diag-cmd] CLEAN SILENCE PROBE TRIGGERED...\n")
+		// Measure Station speaker playback lag before muting
+		preRes := acoustic.AnalyzeRoomSync(600, float64(curStationMs))
+		measuredSpkLag := preRes.SpkLagMs
+
+		// Mute Station speaker via amixer so TV is heard in complete isolation
+		_ = exec.Command("amixer", "set", "Master", "0%").Run()
+		time.Sleep(1200 * time.Millisecond) // Allow entire 1000 ms ring buffer to clear of Station sound
+
+		probeRes := acoustic.AnalyzeRoomSync(1000, float64(curStationMs))
+
+		// Restore Station volume
+		stVol := int(atomic.LoadInt64(atomicStationVol))
+		targetPct := stVol * 10
+		if targetPct <= 0 {
+			targetPct = 50
+		} else if targetPct > 100 {
+			targetPct = 100
+		}
+		_ = exec.Command("amixer", "set", "Master", fmt.Sprintf("%d%%", targetPct)).Run()
+
+		errMsec := probeRes.TvLagMs - measuredSpkLag
+		fmt.Fprintf(os.Stderr, "[diag-cmd] CLEAN PROBE RESULT: status=%s tv_lag=%.1f ms spk_lag=%.1f ms mismatch=%.1f ms tv_mag=%.4f tv_psr=%.1f valid=%v\n",
+			probeRes.Status, probeRes.TvLagMs, measuredSpkLag, errMsec, probeRes.TvMag, probeRes.TvPsr, probeRes.Valid)
+	}
 }
 
 type Player struct {
@@ -284,6 +357,7 @@ func main() {
 	var atomicTargetDelay int64 = int64(getInitialDelayMs())
 	var atomicTvSpeakerDelay int64 = 0
 	var atomicTvVolume int64 = 8
+	var atomicStationVolume int64 = 5
 	var atomicIsMuted int64 = 0
 	var atomicTargetQBits uint64
 
@@ -409,7 +483,19 @@ func main() {
 			curStationMs := int(atomic.LoadInt64(&atomicTargetDelay))
 			curTvSpkMs := int(atomic.LoadInt64(&atomicTvSpeakerDelay))
 
+			checkManualCommands(curStationMs, setStationDelay, player, acoustic, &atomicStationVolume)
+			curStationMs = int(atomic.LoadInt64(&atomicTargetDelay))
+
 			res := acoustic.AnalyzeRoomSync(1200, float64(curStationMs))
+
+			fmt.Fprintf(os.Stderr, "[diag-obs] status=%s tv_lag=%.1f ms spk_lag=%.1f ms err=%.1f ms conf=%.2f spk_mag=%.4f tv_mag=%.4f ratio=%.3f psr=%.1f st_delay=%d ms\n",
+				res.Status, res.TvLagMs, res.SpkLagMs, res.AcousticErr, res.TvConf, res.SpkMag, res.TvMag, res.Ratio, res.TvPsr, curStationMs)
+
+			if isObservationMode() {
+				// Closed loop delay adjustment is frozen in Observation Mode.
+				continue
+			}
+
 			if !res.Valid {
 				continue
 			}
@@ -556,6 +642,7 @@ func main() {
 				isMuted := buf[14] != 0
 
 				atomic.StoreInt64(&atomicTvVolume, int64(tvVol))
+				atomic.StoreInt64(&atomicStationVolume, int64(stationVol))
 				if isMuted {
 					atomic.StoreInt64(&atomicIsMuted, 1)
 				} else {
@@ -713,15 +800,20 @@ func main() {
 				curStationMs := int(atomic.LoadInt64(&atomicTargetDelay))
 				res := acoustic.AnalyzeRoomSync(600, float64(curStationMs))
 				if res.Valid && res.TvConf >= 0.50 {
-					initDelay := int(math.Round(res.TvLagMs - 19.0))
-					if initDelay < minStationMs {
-						initDelay = minStationMs
-					} else if initDelay > maxStationMs {
-						initDelay = maxStationMs
+					if !isObservationMode() {
+						initDelay := int(math.Round(res.TvLagMs - 19.0))
+						if initDelay < minStationMs {
+							initDelay = minStationMs
+						} else if initDelay > maxStationMs {
+							initDelay = maxStationMs
+						}
+						setStationDelay(initDelay)
+						fmt.Fprintf(os.Stderr, "[station-rx] Initial Silence Probe LOCKED TV: tv_lag=%.1f ms -> st_delay=%d ms (conf=%.2f)\n",
+							res.TvLagMs, initDelay, res.TvConf)
+					} else {
+						fmt.Fprintf(os.Stderr, "[station-rx] Initial Silence Probe MEASURED TV (ObsMode): tv_lag=%.1f ms, conf=%.2f, holding st_delay=%d ms\n",
+							res.TvLagMs, res.TvConf, curStationMs)
 					}
-					setStationDelay(initDelay)
-					fmt.Fprintf(os.Stderr, "[station-rx] Initial Silence Probe LOCKED TV: tv_lag=%.1f ms -> st_delay=%d ms (conf=%.2f)\n",
-						res.TvLagMs, initDelay, res.TvConf)
 					probeDone = true
 					break
 				}
