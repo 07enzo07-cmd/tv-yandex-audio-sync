@@ -40,9 +40,9 @@ const (
 	dmaSpkBytes   = dmaSpkFrames * 2 * 2
 
 	// NLMS Adaptive Acoustic Echo Canceller parameters (16 kHz):
-	// Cancels the Station's own internal speaker (2.5 cm from microphones) using exact hardware loopback TODDR_B.
-	// 64 taps = 4.0 ms filter length: cancels enclosure resonance AND chassis coupling with minimal CPU.
-	nlmsFilterLen = 64
+	// Cancels the Station's internal speaker AND couch/table reflections up to 16.0 ms using hardware loopback TODDR_B.
+	// 256 taps = 16.0 ms filter length: cancels enclosure resonance, plastic chassis AND couch reflections (3.9 ms).
+	nlmsFilterLen = 256
 	nlmsStepMu    = 0.05
 	nlmsEps       = 1e-4
 
@@ -373,7 +373,7 @@ func fftInPlace(a []complex128, invert bool) {
 
 // AnalyzeRoomSync runs regularized FFT-based GCC-PHAT over the latest windowSamples (e.g. 8192 samples = 512 ms)
 // completely passively without interrupting playback.
-func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayMs float64, geomAirMs float64) AcousticResult {
+func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayMs float64, geomAirMs float64, appHint int) AcousticResult {
 	var res AcousticResult
 	winSamples := windowMs * (decimRate / 1000)
 	if winSamples > fftSize/2 {
@@ -593,12 +593,24 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 	spkCenterSample := int(math.Round(res.SpkLagMs * 16.0))
 	spkBlankRadius := 48
 
-	// Wide physical corridor for TV arrival at Station microphones:
-	// - Pure audio apps (Spotify): ~120..150 ms
-	// - TV Video players (YouTube, ExoPlayer, Kinopoisk): 380..450 ms (256 ms track buffer + 163 ms HAL latency)
-	// - Broad search corridor: 70 ms .. 750 ms covers ALL known Android TV apps without artificial blindness.
-	minSearchSample := int(70.0 * 16.0)  // 70 ms = 1120 samples
-	maxSearchSample := int(750.0 * 16.0) // 750 ms = 12000 samples
+	// Physical corridor for TV arrival at Station microphones:
+	// - YouTube / Kinopoisk (ExoPlayer Video): TV Audio HAL write latency is 163 ms + buffer = ~215..230 ms
+	// - Spotify (pure audio): ~130..150 ms
+	// - Twitch (low latency): ~125..145 ms
+	minSearchSample := int(100.0 * 16.0)
+	maxSearchSample := int(350.0 * 16.0)
+
+	switch appHint {
+	case 1, 4, 14, 15, 40: // YouTube / Kinopoisk / generic video
+		minSearchSample = int(175.0 * 16.0) // 175 ms
+		maxSearchSample = int(265.0 * 16.0) // 265 ms
+	case 2, 12: // Spotify pure audio
+		minSearchSample = int(120.0 * 16.0) // 120 ms
+		maxSearchSample = int(175.0 * 16.0) // 175 ms
+	case 3, 7: // Twitch low latency
+		minSearchSample = int(115.0 * 16.0) // 115 ms
+		maxSearchSample = int(165.0 * 16.0) // 165 ms
+	}
 
 	var maxTv float64
 	bestTvSample := -1

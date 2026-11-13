@@ -37,7 +37,7 @@ const (
 )
 
 func getInitialDelayMs() int {
-	target := 400 // Default matching TV video player latency (YouTube / ExoPlayer ~400 ms)
+	target := 218 // Default matching measured TV video player latency (YouTube / Vivax Audio HAL ~222 ms)
 	data, err := os.ReadFile("/data/audiosync/delay_ms")
 	if err == nil {
 		str := strings.TrimSpace(string(data))
@@ -276,6 +276,7 @@ func main() {
 
 	var atomicTargetDelay int64 = int64(getInitialDelayMs())
 	var atomicTvSpeakerDelay int64 = 0
+	var atomicAppHint int64 = 1
 	var atomicTargetQBits uint64
 
 	var rxPkts, droppedPkts, duplicatePkts, resyncEvents, pllShrinks, pllExpands uint64
@@ -384,9 +385,10 @@ func main() {
 
 			curStationMs := int(atomic.LoadInt64(&atomicTargetDelay))
 			curTvSpkMs := int(atomic.LoadInt64(&atomicTvSpeakerDelay))
+			curAppHint := int(atomic.LoadInt64(&atomicAppHint))
 			airMs := getGeomAirMs()
 
-			res := acoustic.AnalyzeRoomSync(512, float64(curStationMs), airMs)
+			res := acoustic.AnalyzeRoomSync(512, float64(curStationMs), airMs, curAppHint)
 			if !res.Valid {
 				continue
 			}
@@ -404,8 +406,8 @@ func main() {
 			}
 
 			// Haas acoustic deadband: ignore sub-6ms differences where human ear hears fused sound
-			if math.Abs(errMs) <= 6.0 || math.Abs(errMs) > 300.0 {
-				smoothedErr = 0.7 * smoothedErr
+			if math.Abs(errMs) <= 6.0 || math.Abs(errMs) > 150.0 {
+				smoothedErr = 0.5 * smoothedErr
 				continue
 			}
 
@@ -433,17 +435,11 @@ func main() {
 			// Require 3 consecutive smoothed measurements of the same sign before micro-adjusting
 			if confirmCount >= 3 {
 				confirmCount = 0
-				deltaMs := int(math.Round(smoothedErr * 0.50))
-				maxStep := 15
-				if math.Abs(smoothedErr) > 60.0 {
-					maxStep = 50
-				} else if math.Abs(smoothedErr) > 30.0 {
-					maxStep = 30
-				}
-				if deltaMs > maxStep {
-					deltaMs = maxStep
-				} else if deltaMs < -maxStep {
-					deltaMs = -maxStep
+				deltaMs := int(math.Round(smoothedErr * 0.40))
+				if deltaMs > 15 {
+					deltaMs = 15
+				} else if deltaMs < -15 {
+					deltaMs = -15
 				}
 
 				newStationMs := curStationMs + deltaMs
@@ -534,20 +530,21 @@ func main() {
 				// App Profile Hint in byte 15 (YouTube: 1, Spotify: 2, Twitch: 3, Kinopoisk: 4)
 				appHint := int(buf[15])
 				if appHint > 0 {
+					atomic.StoreInt64(&atomicAppHint, int64(appHint))
 					var desiredStationMs int
 					var desiredTvSpkMs int
 					switch appHint {
-					case 1, 15: // YouTube / generic video (ExoPlayer has ~400 ms AudioTrack + HAL latency)
-						desiredStationMs = 400
+					case 1, 15: // YouTube / generic video (TV Audio HAL ~222 ms)
+						desiredStationMs = 218
 						desiredTvSpkMs = 0
-					case 2, 12: // Spotify pure audio (low-latency AudioTrack ~148 ms)
-						desiredStationMs = 148
+					case 2, 12: // Spotify pure audio (low-latency AudioTrack ~145 ms)
+						desiredStationMs = 145
 						desiredTvSpkMs = 0
 					case 3, 7: // Twitch low latency (~135 ms)
 						desiredStationMs = 135
 						desiredTvSpkMs = 0
-					case 4, 40, 14: // Kinopoisk / Kinopub video (ExoPlayer ~400 ms)
-						desiredStationMs = 400
+					case 4, 40, 14: // Kinopoisk / Kinopub video (~218 ms)
+						desiredStationMs = 218
 						desiredTvSpkMs = 0
 					default:
 						if appHint >= 10 && appHint <= 70 {
