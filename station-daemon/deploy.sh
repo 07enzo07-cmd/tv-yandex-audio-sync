@@ -1,9 +1,11 @@
 #!/bin/bash
 set -e
 
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 if [ -z "$1" ]; then
     echo "Использование: ./deploy.sh <IP_СТАНЦИИ> [ADB_PORT]"
-    echo "Пример: ./deploy.sh 192.168.1.100"
+    echo "Пример: ./deploy.sh 192.168.1.132"
     exit 1
 fi
 
@@ -15,10 +17,7 @@ echo "=== Развертывание демона на Яндекс Станци
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
-if [ ! -f "station-rx" ]; then
-    echo "Бинарник station-rx не найден, запускаем сборку..."
-    ./build.sh
-fi
+./build.sh
 
 if [ "$ADB_PORT" != "5555" ]; then
     ADB="adb -P $ADB_PORT"
@@ -31,11 +30,11 @@ $ADB connect "$STATION_IP:5555" || true
 
 echo "Копирование бинарника..."
 $ADB -s "$STATION_IP:5555" shell mkdir -p /data/audiosync
+$ADB -s "$STATION_IP:5555" shell "killall -9 station-rx aplay 2>/dev/null || true"
 $ADB -s "$STATION_IP:5555" push station-rx /data/audiosync/station-rx
 $ADB -s "$STATION_IP:5555" shell chmod +x /data/audiosync/station-rx
 
 echo "Перезапуск демона на Станции..."
-$ADB -s "$STATION_IP:5555" shell "killall -9 station-rx 2>/dev/null || true"
 $ADB -s "$STATION_IP:5555" shell "start-stop-daemon -S -b -x /data/audiosync/station-rx"
 
 echo "=== Развертывание на Станцию успешно завершено! ==="

@@ -16,3 +16,5 @@ tv-app/src/**/R.java
 
 # Keystores (keep debug.keystore if desired, or ignore secrets)
 *.jks
+station-daemon/vqe-inspect/
+

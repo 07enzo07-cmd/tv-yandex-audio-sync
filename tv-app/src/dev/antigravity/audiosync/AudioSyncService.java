@@ -6,7 +6,6 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.app.usage.UsageEvents;
-import android.app.usage.UsageStats;
 import android.app.usage.UsageStatsManager;
 import android.bluetooth.BluetoothA2dp;
 import android.content.BroadcastReceiver;
@@ -34,12 +33,12 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.List;
 
 public class AudioSyncService extends Service {
     private static final String TAG = "TvAudioSyncService";
     private static final String CHANNEL_ID = "tv_audio_sync_channel";
     private static final int NOTIFICATION_ID = 2026;
+    private static final int SACK_MAGIC = 0x5341434B; // 'SACK' from Station Acoustic Controller
 
     public static final String ACTION_START = "ACTION_START";
     public static final String ACTION_STOP = "ACTION_STOP";
@@ -52,18 +51,22 @@ public class AudioSyncService extends Service {
     public static volatile boolean isHeadphonesConnected = false;
     public static volatile int globalDelayOffsetMs = 0;
 
+    // Live telemetry reported back by Station Acoustic Controller ('SACK' packets)
+    public static volatile int liveStationDelayMs = 150;
+    public static volatile int liveTvSpeakerDelayMs = 0;
+    public static volatile float liveAcousticErrMs = 0.0f;
+    public static volatile float liveAcousticConf = 0.0f;
+    private volatile long lastSackTimeMs = 0;
+
     private volatile int currentTvVolume = 8;
     private volatile int currentStationVolume = 4;
     private volatile boolean currentIsMuted = false;
 
-    // Dynamic delay calibration:
-    // Tunneled / AV-Sync apps (YouTube, KinoPub, 4K video) -> 160 ms (calibrated with Dolby MS12)
-    // Low-latency / live apps (Twitch AAudio)              -> 80 ms
-    private volatile int currentTargetDelayMs = 160;
-
     private MediaProjection mediaProjection;
     private AudioRecord audioRecord;
     private Thread workerThread;
+    private Thread ackListenerThread;
+    private Thread appDetectorThread;
     private volatile boolean isCapturing = false;
     private volatile boolean isScreenOff = false;
 
@@ -76,6 +79,49 @@ public class AudioSyncService extends Service {
     private NotificationManager notificationManager;
     private UsageStatsManager usageStatsManager;
     private boolean isReceiverRegistered = false;
+
+    private String currentForegroundPkg = "";
+    private long lastEventsQueryTime = 0;
+    private volatile byte currentAppHint = 1; // 1=YouTube/Video, 2=Spotify, 3=Twitch, 4=Kinopub
+
+    private byte detectActiveApp() {
+        byte hint = 1; // Default video mode
+        if (usageStatsManager != null) {
+            try {
+                long now = System.currentTimeMillis();
+                if (lastEventsQueryTime == 0) {
+                    lastEventsQueryTime = now - 1000L * 3600 * 4;
+                }
+                UsageEvents events = usageStatsManager.queryEvents(lastEventsQueryTime, now);
+                if (events != null) {
+                    UsageEvents.Event event = new UsageEvents.Event();
+                    while (events.hasNextEvent()) {
+                        events.getNextEvent(event);
+                        if (event.getEventType() == UsageEvents.Event.ACTIVITY_RESUMED) {
+                            String pkg = event.getPackageName();
+                            if (pkg != null && !pkg.contains("systemui") && !pkg.contains("permissioncontroller") && !pkg.contains("audiosync")) {
+                                currentForegroundPkg = pkg;
+                            }
+                        }
+                    }
+                }
+                lastEventsQueryTime = now - 5000L;
+
+                if (currentForegroundPkg.contains("spotify")) {
+                    hint = 2; // Spotify pure audio
+                } else if (currentForegroundPkg.contains("twitch")) {
+                    hint = 3; // Twitch live
+                } else if (currentForegroundPkg.contains("watch.kino") || currentForegroundPkg.contains("kinopub")) {
+                    hint = 4; // Kinopoisk / Kinopub
+                } else {
+                    hint = 1; // YouTube / generic video
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "detectActiveApp error: " + e.getMessage());
+            }
+        }
+        return hint;
+    }
 
     private AudioDeviceCallback audioDeviceCallback = new AudioDeviceCallback() {
         @Override
@@ -136,72 +182,6 @@ public class AudioSyncService extends Service {
         }
     }
 
-    private String currentForegroundPkg = "";
-    private long lastEventsQueryTime = 0;
-
-    private int detectOptimalDelay() {
-        int baseDelay = 150; // Sweet spot for YouTube, Kinopub, and Spotify (calibrated to TV AudioOut_D ~161.5ms latency)
-
-        if (usageStatsManager != null) {
-            try {
-                long now = System.currentTimeMillis();
-                if (lastEventsQueryTime == 0) {
-                    lastEventsQueryTime = now - 1000L * 3600 * 6; // Initial lookback: 6 hours
-                }
-                UsageEvents events = usageStatsManager.queryEvents(lastEventsQueryTime, now);
-                if (events != null) {
-                    UsageEvents.Event event = new UsageEvents.Event();
-                    while (events.hasNextEvent()) {
-                        events.getNextEvent(event);
-                        if (event.getEventType() == UsageEvents.Event.ACTIVITY_RESUMED) {
-                            String pkg = event.getPackageName();
-                            if (pkg != null && !pkg.contains("systemui") && !pkg.contains("permissioncontroller") && !pkg.contains("audiosync")) {
-                                currentForegroundPkg = pkg;
-                            }
-                        }
-                    }
-                }
-                lastEventsQueryTime = now - 5000L; // Overlap by 5s
-
-                String profileKey = "youtube";
-                if (currentForegroundPkg.contains("twitch")) {
-                    profileKey = "twitch";
-                    baseDelay = 70; // Twitch live stream low-latency mode (70 ms)
-                } else if (currentForegroundPkg.contains("watch.kino") || currentForegroundPkg.contains("kinopub")) {
-                    profileKey = "kinopub";
-                    baseDelay = 150; // Kinopub native stream mode (150 ms)
-                } else if (currentForegroundPkg.contains("spotify")) {
-                    profileKey = "spotify";
-                    baseDelay = 40; // Spotify audio streaming mode (40 ms: pure audio without VOD display lag)
-                } else {
-                    profileKey = "youtube";
-                    baseDelay = 150; // YouTube / Kinopoisk / other media players (150 ms)
-                }
-
-                if ("spotify".equals(profileKey)) {
-                    applySpeakerDelay(95); // Delay TV speakers by 95ms to achieve <5ms acoustic sync with Station
-                } else {
-                    applySpeakerDelay(0);  // Zero delay for YouTube, Kinopoisk, Twitch (handled by A/V sync)
-                }
-
-                try {
-                    int customDelay = android.provider.Settings.Global.getInt(
-                            getContentResolver(), "vivax_audio_delay_" + profileKey, -1);
-                    if (customDelay >= 40 && customDelay <= 1200) {
-                        baseDelay = customDelay;
-                    }
-                } catch (Exception ignored) {}
-            } catch (Exception e) {
-                Log.w(TAG, "detectOptimalDelay error: " + e.getMessage());
-            }
-        }
-
-        int effectiveDelay = baseDelay + globalDelayOffsetMs;
-        if (effectiveDelay < 40) effectiveDelay = 40;
-        if (effectiveDelay > 1200) effectiveDelay = 1200;
-        return effectiveDelay;
-    }
-
     @Override
     public void onCreate() {
         super.onCreate();
@@ -217,7 +197,7 @@ public class AudioSyncService extends Service {
 
         updateHeadphoneState();
         updateTvVolume();
-        currentTargetDelayMs = detectOptimalDelay();
+        applySpeakerDelay(0);
 
         if (audioManager != null) {
             audioManager.registerAudioDeviceCallback(audioDeviceCallback, null);
@@ -297,7 +277,7 @@ public class AudioSyncService extends Service {
 
         String contentText = isHeadphonesConnected
                 ? "Наушники подключены (колонка отключена)"
-                : "Трансляция звука на Яндекс Станцию активна";
+                : "Универсальная акустическая синхронизация активна";
 
         Notification.Builder builder;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -325,7 +305,7 @@ public class AudioSyncService extends Service {
             String ip = intent.getStringExtra(EXTRA_IP);
             if (ip == null || ip.isEmpty()) {
                 android.content.SharedPreferences prefs = getSharedPreferences("audiosync", Context.MODE_PRIVATE);
-                ip = prefs.getString("station_ip", "192.168.1.100");
+                ip = prefs.getString("station_ip", "192.168.1.132");
             }
 
             startStreaming(resultCode, resultData, ip);
@@ -366,7 +346,7 @@ public class AudioSyncService extends Service {
                             .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_NONE)
                             .build();
 
-                    keepAliveTrack.setVolume(0.0f); // 100% silent, keeps HAL & PatchTrack alive
+                    keepAliveTrack.setVolume(0.0f);
                     keepAliveTrack.play();
                     Log.i(TAG, "Keepalive AudioTrack started (MediaTek Audio HAL pinned active)");
 
@@ -378,7 +358,6 @@ public class AudioSyncService extends Service {
                         }
                         int written = keepAliveTrack.write(zeros, 0, zeros.length);
                         if (written < 0) {
-                            Log.w(TAG, "keepAliveTrack write error: " + written);
                             SystemClock.sleep(100);
                         }
                     }
@@ -409,6 +388,72 @@ public class AudioSyncService extends Service {
             keepAliveThread = null;
         }
         stopKeepAliveTrackInternal();
+    }
+
+    private void startAppDetectorThread() {
+        if (appDetectorThread != null) return;
+        appDetectorThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (isCapturing) {
+                    try {
+                        byte newHint = detectActiveApp();
+                        if (newHint != currentAppHint) {
+                            Log.i(TAG, "App profile switch: hint " + currentAppHint + " -> " + newHint + " (" + currentForegroundPkg + ")");
+                            currentAppHint = newHint;
+                            applySpeakerDelay(0);
+                        }
+                    } catch (Exception e) {
+                        Log.w(TAG, "appDetectorThread error: " + e.getMessage());
+                    }
+                    SystemClock.sleep(2500);
+                }
+            }
+        }, "AppDetectorThread");
+        appDetectorThread.start();
+    }
+
+    private void startAckListener(final DatagramSocket socket) {
+        ackListenerThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                byte[] rxBuf = new byte[64];
+                ByteBuffer bb = ByteBuffer.wrap(rxBuf);
+                bb.order(ByteOrder.BIG_ENDIAN);
+
+                while (isCapturing && socket != null && !socket.isClosed()) {
+                    try {
+                        DatagramPacket pkt = new DatagramPacket(rxBuf, rxBuf.length);
+                        socket.receive(pkt);
+                        if (pkt.getLength() >= 12) {
+                            bb.clear();
+                            int magic = bb.getInt(0);
+                            if (magic == SACK_MAGIC) {
+                                int reqTvSpkDelay = bb.getShort(4) & 0xFFFF;
+                                int stDelay = bb.getShort(6) & 0xFFFF;
+                                short errTenths = bb.getShort(8);
+                                int confPermille = bb.getShort(10) & 0xFFFF;
+
+                                int effectiveTvSpk = reqTvSpkDelay + globalDelayOffsetMs;
+                                if (effectiveTvSpk < 0) effectiveTvSpk = 0;
+                                if (effectiveTvSpk > 160) effectiveTvSpk = 160;
+
+                                liveStationDelayMs = stDelay;
+                                liveTvSpeakerDelayMs = effectiveTvSpk;
+                                liveAcousticErrMs = errTenths / 10.0f;
+                                liveAcousticConf = confPermille / 1000.0f;
+                                lastSackTimeMs = SystemClock.elapsedRealtime();
+
+                                applySpeakerDelay(effectiveTvSpk);
+                            }
+                        }
+                    } catch (Exception ignored) {
+                        if (!isCapturing) break;
+                    }
+                }
+            }
+        }, "StationAckListenerThread");
+        ackListenerThread.start();
     }
 
     private synchronized void startStreaming(int resultCode, Intent resultData, final String targetIp) {
@@ -465,8 +510,8 @@ public class AudioSyncService extends Service {
 
         isCapturing = true;
         audioRecord.startRecording();
-        startKeepAliveTrack(); // Pin MediaTek Audio HAL active to eliminate phase jumps
-        Log.i(TAG, "AudioPlaybackCapture started. Target UDP: " + targetIp + ":12345");
+        startKeepAliveTrack();
+        Log.i(TAG, "Universal AudioPlaybackCapture started (Zero App Rules). Target UDP: " + targetIp + ":12345");
 
         workerThread = new Thread(new Runnable() {
             @Override
@@ -474,6 +519,8 @@ public class AudioSyncService extends Service {
                 DatagramSocket socket = null;
                 try {
                     socket = new DatagramSocket();
+                    startAckListener(socket);
+                    startAppDetectorThread();
                     InetAddress dest = InetAddress.getByName(targetIp);
                     int port = 12345;
 
@@ -482,7 +529,6 @@ public class AudioSyncService extends Service {
                     ByteBuffer bb = ByteBuffer.wrap(sendBuffer);
                     bb.order(ByteOrder.BIG_ENDIAN);
 
-                    // Drain initial burst / backlog from AudioRecord to ensure minimum capture latency
                     if (audioRecord != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                         byte[] drainBuf = new byte[4096];
                         while (audioRecord.read(drainBuf, 0, drainBuf.length, AudioRecord.READ_NON_BLOCKING) > 0) {
@@ -492,57 +538,53 @@ public class AudioSyncService extends Service {
 
                     long packetCount = 0;
                     long lastLogTime = System.currentTimeMillis();
-                    PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
                     updateTvVolume();
-                    int loopCounter = 0;
+                    currentAppHint = detectActiveApp();
+                    applySpeakerDelay(0);
 
                     while (isCapturing) {
                         if (audioRecord == null) {
-                            SystemClock.sleep(50);
+                            SystemClock.sleep(20);
                             continue;
                         }
 
                         int read = audioRecord.read(pcmBuffer, 0, pcmBuffer.length);
                         if (read > 0) {
-                            boolean isInteractive = pm == null || pm.isInteractive();
-                            if (isScreenOff || !isInteractive || isHeadphonesConnected) {
+                            if (isScreenOff || isHeadphonesConnected) {
                                 continue;
                             }
 
-                            loopCounter++;
-                            if (loopCounter % 100 == 0) { // Every 1 second, detect active app profile
-                                int detected = detectOptimalDelay();
-                                if (detected != currentTargetDelayMs) {
-                                    Log.i(TAG, "App profile switch: target delay changed " + currentTargetDelayMs + " ms -> " + detected + " ms");
-                                    currentTargetDelayMs = detected;
-                                }
-                            }
+                            long nowElapsed = SystemClock.elapsedRealtime();
 
-                            // Pack 16-byte SYNC header + PCM data:
-                            // 0..3: 'SYNC' (4B)
-                            // 4..7: seq packetCount (4B)
-                            // 8..11: timestamp ms (4B)
-                            // 12: tvVolume (1B)
-                            // 13: stationVolume (1B)
-                            // 14: isMuted (1B)
-                            // 15: targetDelay / 10 (1B, e.g. 13 for 130ms, 21 for 210ms)
+                            // 16-byte SYNC header + PCM data:
+                            // Byte 15 sends App Profile Hint (1: YouTube, 2: Spotify, 3: Twitch, 4: Kinopub)
                             bb.clear();
                             bb.putInt(0x53594E43); // 'SYNC' magic
                             bb.putInt((int) packetCount);
                             bb.putInt((int) (SystemClock.elapsedRealtime() & 0xFFFFFFFFL));
-                            bb.put((byte) ((currentTvVolume & 0x7F) | 0x80)); // bit 7: shortPipe (4096B F_SETPIPE_SZ)
+                            bb.put((byte) ((currentTvVolume & 0x7F) | 0x80));
                             bb.put((byte) currentStationVolume);
                             bb.put((byte) (currentIsMuted ? 1 : 0));
-                            bb.put((byte) (currentTargetDelayMs / 10)); // Dynamic Target Delay from TV!
+                            bb.put(currentAppHint); // Byte 15: App Profile Hint (updated smoothly in background)
                             bb.put(pcmBuffer, 0, read);
 
                             DatagramPacket packet = new DatagramPacket(sendBuffer, 16 + read, dest, port);
                             socket.send(packet);
                             packetCount++;
 
+                            if (lastSackTimeMs > 0 && (nowElapsed - lastSackTimeMs) > 5000) {
+                                int fallbackDelay = 0;
+                                if (liveTvSpeakerDelayMs != fallbackDelay) {
+                                    Log.w(TAG, "No SACK from Station for >5s: resetting TV speaker delay to 0 ms");
+                                    liveTvSpeakerDelayMs = fallbackDelay;
+                                    applySpeakerDelay(fallbackDelay);
+                                }
+                            }
+
                             long now = System.currentTimeMillis();
                             if (now - lastLogTime >= 5000) {
-                                Log.i(TAG, String.format("Stream stats: %d packets sent (Active Hot Channel, targetDelay=%dms)", packetCount, currentTargetDelayMs));
+                                Log.i(TAG, String.format("Stream stats: %d pkts (appHint=%d) | StationDelay=%dms, TvSpkDelay=%dms, Err=%.1fms (conf=%.2f)",
+                                        packetCount, currentAppHint, liveStationDelayMs, liveTvSpeakerDelayMs, liveAcousticErrMs, liveAcousticConf));
                                 lastLogTime = now;
                             }
                         } else if (read < 0) {
@@ -568,12 +610,10 @@ public class AudioSyncService extends Service {
                                     audioRecord.startRecording();
                                     Log.i(TAG, "AudioRecord auto-recovered successfully!");
                                 } else {
-                                    Log.e(TAG, "AudioRecord recovery failed (not initialized)");
                                     audioRecord = null;
                                     SystemClock.sleep(1000);
                                 }
                             } catch (Exception recEx) {
-                                Log.e(TAG, "AudioRecord recovery exception: " + recEx.getMessage());
                                 audioRecord = null;
                                 SystemClock.sleep(1000);
                             }
@@ -602,6 +642,14 @@ public class AudioSyncService extends Service {
         if (workerThread != null) {
             workerThread.interrupt();
             workerThread = null;
+        }
+        if (ackListenerThread != null) {
+            ackListenerThread.interrupt();
+            ackListenerThread = null;
+        }
+        if (appDetectorThread != null) {
+            appDetectorThread.interrupt();
+            appDetectorThread = null;
         }
 
         if (audioRecord != null) {
@@ -648,11 +696,9 @@ public class AudioSyncService extends Service {
     private void enforceDefaultDspProfile() {
         try {
             android.content.ContentResolver cr = getContentResolver();
-            // Обязательные включённые модули по умолчанию:
             android.provider.Settings.Global.putInt(cr, "sound_advanced_surround_virtualizer", 1);
             android.provider.Settings.Global.putInt(cr, "sound_advanced_dolby_atmos", 1);
             android.provider.Settings.Global.putInt(cr, "sound_bass_enhancement", 1);
-            // Отключаем конфликтующие виртуализаторы и буферизующие лимитеры:
             android.provider.Settings.Global.putInt(cr, "sound_dts_virtual_x", 0);
             android.provider.Settings.Global.putInt(cr, "sound_dts_studio_surround", 0);
             android.provider.Settings.Global.putInt(cr, "sound_dbx_total_surround", 0);
@@ -664,19 +710,20 @@ public class AudioSyncService extends Service {
 
     private int currentSpeakerDelay = -1;
 
-    private void applySpeakerDelay(int delayMs) {
+    private synchronized void applySpeakerDelay(int delayMs) {
+        if (currentSpeakerDelay >= 0 && delayMs != 0 && Math.abs(currentSpeakerDelay - delayMs) < 5) {
+            return;
+        }
         if (currentSpeakerDelay != delayMs) {
             currentSpeakerDelay = delayMs;
             try {
                 if (audioManager != null) {
                     audioManager.setParameters("speaker_audio_delay=" + delayMs);
                 }
-                android.provider.Settings.Global.putInt(getContentResolver(), "sound_speaker_delay", delayMs);
-                Log.i(TAG, "Applied speaker_audio_delay=" + delayMs + " ms");
+                Log.i(TAG, "Applied speaker_audio_delay=" + delayMs + " ms (controlled by Station Acoustic Sync)");
             } catch (Throwable t) {
                 Log.w(TAG, "Failed to apply speaker_audio_delay: " + t.getMessage());
             }
         }
     }
-
 }

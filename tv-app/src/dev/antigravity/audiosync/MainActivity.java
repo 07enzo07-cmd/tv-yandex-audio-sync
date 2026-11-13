@@ -74,7 +74,7 @@ public class MainActivity extends Activity {
         btnDelayPlus = findViewById(R.id.btnDelayPlus);
 
         final android.content.SharedPreferences prefs = getSharedPreferences("audiosync", Context.MODE_PRIVATE);
-        String savedIp = prefs.getString("station_ip", "192.168.1.100");
+        String savedIp = prefs.getString("station_ip", "192.168.1.132");
         etIp.setText(savedIp);
 
         updateDelayInfo(prefs);
@@ -280,7 +280,8 @@ public class MainActivity extends Activity {
         AudioSyncService.globalDelayOffsetMs = currentOffset;
         String sign = currentOffset > 0 ? "+" : "";
         if (tvDelayInfo != null) {
-            tvDelayInfo.setText("Смещение: " + sign + currentOffset + " мс (YouTube: " + (140 + currentOffset) + " мс, Кинопаб: " + (60 + currentOffset) + " мс, Spotify: " + (60 + currentOffset) + " мс, Twitch: " + (60 + currentOffset) + " мс)");
+            tvDelayInfo.setText(String.format("Ручная поправка ТВ: %s%d мс | Авто-синхр: Станция %d мс, ТВ %d мс (ошибка %.1f мс)",
+                    sign, currentOffset, AudioSyncService.liveStationDelayMs, AudioSyncService.liveTvSpeakerDelayMs, AudioSyncService.liveAcousticErrMs));
         }
     }
 
@@ -326,7 +327,7 @@ public class MainActivity extends Activity {
             btnToggle.setEnabled(true);
             if (resultCode == Activity.RESULT_OK && data != null) {
                 String ip = etIp.getText().toString().trim();
-                if (ip.isEmpty()) ip = "192.168.1.100";
+                if (ip.isEmpty()) ip = "192.168.1.132";
                 getSharedPreferences("audiosync", Context.MODE_PRIVATE).edit().putString("station_ip", ip).apply();
 
                 Intent serviceIntent = new Intent(this, AudioSyncService.class);
