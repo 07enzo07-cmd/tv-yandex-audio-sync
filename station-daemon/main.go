@@ -30,9 +30,9 @@ const (
 	// Calibrated nominal Station delay is 148 ms (4.8 chunks in Go queue + 100 ms ALSA/pipe),
 	// which provides a rock-solid 48 ms jitter cushion with 0 stalls, 0 drops, and 0 underruns,
 	// while naturally matching the TV's acoustic latency (MediaTek Audio HAL + Dolby Atmos + air travel).
-	alsaBaseMs   = 100.0
-	minStationMs = 100  // Physical minimum stable latency of Station (0 chunks Go queue + 100 ms ALSA/pipe)
-	maxStationMs = 950  // Maximum allowed Station buffer delay (supports Spotify ~731 ms & video ~220 ms)
+	alsaBaseMs   = 70.0
+	minStationMs = 70   // Physical minimum stable latency of Station (4096B pipe + 2880 buffer)
+	maxStationMs = 950  // Maximum allowed Station buffer delay (supports deep-buffer streaming & video)
 	geomAirMs    = 7.0  // Acoustic time-of-flight from TV to Station microphones (~2.4 meters)
 )
 
@@ -46,6 +46,12 @@ func getInitialDelayMs() int {
 		}
 	}
 	return target
+}
+
+func saveCalibratedDelay(delayMs int) {
+	if delayMs >= minStationMs && delayMs <= maxStationMs {
+		_ = os.WriteFile("/data/audiosync/delay_ms", []byte(strconv.Itoa(delayMs)), 0644)
+	}
 }
 
 func getGeomAirMs() float64 {
@@ -83,7 +89,7 @@ func (p *Player) Start() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	cmd := exec.Command("/usr/bin/aplay", "-D", "default", "--buffer-size=3840", "--period-size=960", "-R", "20000", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "2", "-q", "-")
+	cmd := exec.Command("/usr/bin/aplay", "-D", "default", "--buffer-size=2880", "--period-size=960", "-R", "20000", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "2", "-q", "-")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -92,6 +98,7 @@ func (p *Player) Start() error {
 	var fd uintptr
 	if file, ok := stdin.(*os.File); ok {
 		fd = file.Fd()
+		_, _, _ = syscall.Syscall(syscall.SYS_FCNTL, fd, fcntlSetPipe, 4096)
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -230,8 +237,8 @@ func expandChunk481(src []byte, dst []byte) []byte {
 // - delayMs = 160 ms -> 6.0 chunks in Go queue
 func targetQueueChunksForDelay(delayMs int) float64 {
 	q := (float64(delayMs) - alsaBaseMs) / 10.0
-	if q < 2.5 {
-		q = 2.5
+	if q < 1.0 {
+		q = 1.0
 	}
 	return q
 }
@@ -276,7 +283,8 @@ func main() {
 
 	var atomicTargetDelay int64 = int64(getInitialDelayMs())
 	var atomicTvSpeakerDelay int64 = 0
-	var atomicAppHint int64 = 1
+	var atomicTvVolume int64 = 8
+	var atomicIsMuted int64 = 0
 	var atomicTargetQBits uint64
 
 	var rxPkts, droppedPkts, duplicatePkts, resyncEvents, pllShrinks, pllExpands uint64
@@ -296,6 +304,7 @@ func main() {
 		q := targetQueueChunksForDelay(delayMs)
 		atomic.StoreInt64(&atomicTargetDelay, int64(delayMs))
 		atomic.StoreUint64(&atomicTargetQBits, *(*uint64)(unsafe.Pointer(&q)))
+		saveCalibratedDelay(delayMs)
 	}
 	getTargetQ := func() float64 {
 		bits := atomic.LoadUint64(&atomicTargetQBits)
@@ -343,7 +352,6 @@ func main() {
 	var lastStationVol int = -1
 	var lastMuted bool = false
 	var hasVol bool = false
-	var lastAppBaseDelay int
 
 	// 1. TV Standby Watchdog (1500 ms timeout)
 	go func() {
@@ -369,33 +377,46 @@ func main() {
 		}
 	}()
 
-	// 2. Closed-Loop Passive Universal Acoustic Controller (Zero Silent Probes, Zero Audio Interruption)
+	// 2. Closed-Loop Autonomous Universal Acoustic Controller (Zero Profiles, Zero App Corridors)
 	go func() {
 		var confirmCount int
 		var lastSign int
 		var smoothedErr float64
+		var shiftConfirmCount int
+		var lastShiftTarget int
 
 		ticker := time.NewTicker(1500 * time.Millisecond)
 		for range ticker.C {
 			if !player.IsRunning() || atomic.LoadUint64(&acoustic.packetsRx) < 100 {
 				confirmCount = 0
 				smoothedErr = 0
+				shiftConfirmCount = 0
+				continue
+			}
+
+			// Strict Volume Rule:
+			// Auto-sync is active ONLY when TV volume >= 4 and unmuted.
+			// When TV volume <= 3 (or muted), auto-sync sleeps and holds the last calibrated delay.
+			tvVol := int(atomic.LoadInt64(&atomicTvVolume))
+			isMuted := atomic.LoadInt64(&atomicIsMuted) != 0
+			if tvVol < 4 || isMuted {
+				confirmCount = 0
+				smoothedErr = 0
+				shiftConfirmCount = 0
 				continue
 			}
 
 			curStationMs := int(atomic.LoadInt64(&atomicTargetDelay))
 			curTvSpkMs := int(atomic.LoadInt64(&atomicTvSpeakerDelay))
-			curAppHint := int(atomic.LoadInt64(&atomicAppHint))
-			airMs := getGeomAirMs()
 
-			res := acoustic.AnalyzeRoomSync(1200, float64(curStationMs), airMs, curAppHint)
+			res := acoustic.AnalyzeRoomSync(1200, float64(curStationMs))
 			if !res.Valid {
 				continue
 			}
 
 			// True acoustic mismatch in listening room:
-			// errMs > 0 -> TV speakers are LATER than Station (need more Station delay or less TV speaker delay)
-			// errMs < 0 -> TV speakers are EARLIER than Station (need less Station delay or more TV speaker delay)
+			// errMs > 0 -> TV speakers are LATER than Station (need more Station delay)
+			// errMs < 0 -> TV speakers are EARLIER than Station (need less Station delay)
 			errMs := res.AcousticErr
 
 			fmt.Fprintf(os.Stderr, "[acoustic-sync] Telemetry: tv_lag=%.1f ms, spk_lag=%.1f ms, err=%.1f ms, conf=%.2f, st_delay=%d ms, tv_spk_delay=%d ms\n",
@@ -405,19 +426,52 @@ func main() {
 				continue
 			}
 
-			// Haas acoustic deadband: ignore sub-6ms differences where human ear hears fused sound
-			if math.Abs(errMs) <= 6.0 || math.Abs(errMs) > 150.0 {
+			// CASE 1: Large stream / app transition (e.g. YouTube ~220 ms <-> Spotify ~115 ms).
+			// Require |errMs| >= 40.0 ms, high confidence (>= 0.65), and 2 consecutive cycles agreeing within +/-20 ms!
+			if math.Abs(errMs) >= 40.0 && res.TvConf >= 0.65 {
+				proposedDelay := curStationMs + int(math.Round(errMs))
+				if proposedDelay < minStationMs {
+					proposedDelay = minStationMs
+				} else if proposedDelay > maxStationMs {
+					proposedDelay = maxStationMs
+				}
+
+				if math.Abs(float64(proposedDelay-lastShiftTarget)) <= 20.0 {
+					shiftConfirmCount++
+				} else {
+					lastShiftTarget = proposedDelay
+					shiftConfirmCount = 1
+				}
+
+				if shiftConfirmCount >= 2 {
+					shiftConfirmCount = 0
+					if proposedDelay != curStationMs {
+						setStationDelay(proposedDelay)
+						fmt.Fprintf(os.Stderr, "[acoustic-sync] UNIVERSAL APP-SHIFT SNAP CONFIRMED (err=%.1f ms, conf=%.2f): Station %d -> %d ms\n",
+							errMs, res.TvConf, curStationMs, proposedDelay)
+					}
+					smoothedErr = 0
+					confirmCount = 0
+				}
+				continue
+			} else {
+				shiftConfirmCount = 0
+			}
+
+			// CASE 2: Fine tracking in near field.
+			// Haas acoustic deadband: ignore sub-3.5ms differences where wavefronts are acoustically fused.
+			if math.Abs(errMs) <= 3.5 {
 				smoothedErr = 0.5 * smoothedErr
 				continue
 			}
 
-			if res.TvConf < 0.55 {
+			if res.TvConf < 0.45 {
 				continue
 			}
 
 			// EMA smoothing filter eliminates single-packet room reflection spikes
-			smoothedErr = 0.30*errMs + 0.70*smoothedErr
-			if math.Abs(smoothedErr) <= 6.0 {
+			smoothedErr = 0.35*errMs + 0.65*smoothedErr
+			if math.Abs(smoothedErr) <= 3.5 {
 				continue
 			}
 
@@ -432,10 +486,10 @@ func main() {
 				confirmCount = 1
 			}
 
-			// Require 3 consecutive smoothed measurements of the same sign before micro-adjusting
-			if confirmCount >= 3 {
+			// Require 2 consecutive smoothed measurements of the same sign before micro-adjusting
+			if confirmCount >= 2 {
 				confirmCount = 0
-				deltaMs := int(math.Round(smoothedErr * 0.40))
+				deltaMs := int(math.Round(smoothedErr * 0.45))
 				if deltaMs > 15 {
 					deltaMs = 15
 				} else if deltaMs < -15 {
@@ -501,6 +555,13 @@ func main() {
 				stationVol := int(buf[13])
 				isMuted := buf[14] != 0
 
+				atomic.StoreInt64(&atomicTvVolume, int64(tvVol))
+				if isMuted {
+					atomic.StoreInt64(&atomicIsMuted, 1)
+				} else {
+					atomic.StoreInt64(&atomicIsMuted, 0)
+				}
+
 				pcm = make([]byte, n-16)
 				copy(pcm, buf[16:n])
 
@@ -525,40 +586,6 @@ func main() {
 							fmt.Fprintf(os.Stderr, "[station-rx] Volume sync: TV %d -> Station %d (%d%%)\n", tv, st, pct)
 						}
 					}(tvVol, stationVol, targetPct, isMuted)
-				}
-
-				// App Profile Hint in byte 15 (YouTube: 1, Spotify: 2, Twitch: 3, Kinopoisk: 4)
-				appHint := int(buf[15])
-				if appHint > 0 {
-					atomic.StoreInt64(&atomicAppHint, int64(appHint))
-					var desiredStationMs int
-					var desiredTvSpkMs int
-					switch appHint {
-					case 1, 15: // YouTube / generic video (TV Audio HAL ~222 ms)
-						desiredStationMs = 218
-						desiredTvSpkMs = 0
-					case 2, 12: // Spotify pure audio (Spotify AudioTrack 44.1k large buffer = 732.65 ms in AudioFlinger)
-						desiredStationMs = 730
-						desiredTvSpkMs = 0
-					case 3, 7: // Twitch low latency (~135 ms)
-						desiredStationMs = 135
-						desiredTvSpkMs = 0
-					case 4, 40, 14: // Kinopoisk / Kinopub video (~218 ms)
-						desiredStationMs = 218
-						desiredTvSpkMs = 0
-					default:
-						if appHint >= 10 && appHint <= 95 {
-							desiredStationMs = appHint * 10
-						}
-					}
-					if desiredStationMs >= minStationMs && desiredStationMs != lastAppBaseDelay {
-						lastAppBaseDelay = desiredStationMs
-						setStationDelay(desiredStationMs)
-						atomic.StoreInt64(&atomicTvSpeakerDelay, int64(desiredTvSpkMs))
-						sendTvSpeakerDelay(desiredTvSpkMs)
-						fmt.Fprintf(os.Stderr, "[station-rx] App Profile Switch (hint %d): Station -> %d ms, TV_spk -> %d ms\n",
-							appHint, desiredStationMs, desiredTvSpkMs)
-					}
 				}
 
 				if hasSeq {
@@ -671,8 +698,41 @@ func main() {
 			continue
 		}
 
+		// Initial Silence Window Probe (800 ms):
+		// Feed silence chunks into aplay so Station speaker remains 100% silent while TV begins playing.
+		// Station microphones capture pure TV room arrival with zero speaker loopback interference.
+		probeDone := false
+		for p := 0; p < 80; p++ {
+			_ = player.Write(silenceChunk)
+			time.Sleep(10 * time.Millisecond)
 
+			tvVol := int(atomic.LoadInt64(&atomicTvVolume))
+			isMuted := atomic.LoadInt64(&atomicIsMuted) != 0
+			// Run probe once at least 500 ms of audio has accumulated
+			if p >= 50 && tvVol >= 4 && !isMuted {
+				curStationMs := int(atomic.LoadInt64(&atomicTargetDelay))
+				res := acoustic.AnalyzeRoomSync(600, float64(curStationMs))
+				if res.Valid && res.TvConf >= 0.50 {
+					initDelay := int(math.Round(res.TvLagMs - 19.0))
+					if initDelay < minStationMs {
+						initDelay = minStationMs
+					} else if initDelay > maxStationMs {
+						initDelay = maxStationMs
+					}
+					setStationDelay(initDelay)
+					fmt.Fprintf(os.Stderr, "[station-rx] Initial Silence Probe LOCKED TV: tv_lag=%.1f ms -> st_delay=%d ms (conf=%.2f)\n",
+						res.TvLagMs, initDelay, res.TvConf)
+					probeDone = true
+					break
+				}
+			}
+		}
+		if !probeDone {
+			fmt.Fprintf(os.Stderr, "[station-rx] Initial Silence Probe finished (using delay %d ms)\n",
+				atomic.LoadInt64(&atomicTargetDelay))
+		}
 
+		targetQ = getTargetQ()
 		emaQ := targetQ
 		lastTargetQ := targetQ
 		fmt.Fprintf(os.Stderr, "[station-rx] aplay started (pid %d) locked at %d ms (targetQ: %.1f, initial qlen: %d)\n",
