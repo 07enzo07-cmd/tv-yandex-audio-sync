@@ -440,7 +440,7 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 	// Sensitive enough for quiet Spotify music / dialogue at TV volume 4..6, while rejecting room silence
 	refRms := math.Sqrt(rawRefSq / float64(winSamples))
 	micRms := math.Sqrt(rawMicSq / float64(winSamples*4))
-	if refRms < 0.004 || micRms < 0.00012 {
+	if refRms < 0.001 || micRms < 0.00008 {
 		return res
 	}
 
@@ -462,7 +462,7 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 		micSlices[ch][0] = 0
 	}
 
-	if refEnergy < 0.002 || micEnergy < 0.0002 {
+	if refEnergy < 0.0005 || micEnergy < 0.00005 {
 		return res
 	}
 
@@ -604,9 +604,9 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 	case 1, 4, 14, 15, 40: // YouTube / Kinopoisk / generic video
 		minSearchSample = int(175.0 * 16.0) // 175 ms
 		maxSearchSample = int(265.0 * 16.0) // 265 ms
-	case 2, 12: // Spotify pure audio
-		minSearchSample = int(120.0 * 16.0) // 120 ms
-		maxSearchSample = int(175.0 * 16.0) // 175 ms
+	case 2, 12: // Spotify pure audio (Spotify AudioTrack 44.1k buffer = 732.65 ms in AudioFlinger)
+		minSearchSample = int(680.0 * 16.0) // 680 ms
+		maxSearchSample = int(785.0 * 16.0) // 785 ms
 	case 3, 7: // Twitch low latency
 		minSearchSample = int(115.0 * 16.0) // 115 ms
 		maxSearchSample = int(165.0 * 16.0) // 165 ms

@@ -32,7 +32,7 @@ const (
 	// while naturally matching the TV's acoustic latency (MediaTek Audio HAL + Dolby Atmos + air travel).
 	alsaBaseMs   = 100.0
 	minStationMs = 100  // Physical minimum stable latency of Station (0 chunks Go queue + 100 ms ALSA/pipe)
-	maxStationMs = 700  // Maximum allowed Station buffer delay (supports video audio pipelines up to 700 ms)
+	maxStationMs = 950  // Maximum allowed Station buffer delay (supports Spotify ~731 ms & video ~220 ms)
 	geomAirMs    = 7.0  // Acoustic time-of-flight from TV to Station microphones (~2.4 meters)
 )
 
@@ -388,7 +388,7 @@ func main() {
 			curAppHint := int(atomic.LoadInt64(&atomicAppHint))
 			airMs := getGeomAirMs()
 
-			res := acoustic.AnalyzeRoomSync(512, float64(curStationMs), airMs, curAppHint)
+			res := acoustic.AnalyzeRoomSync(1200, float64(curStationMs), airMs, curAppHint)
 			if !res.Valid {
 				continue
 			}
@@ -537,8 +537,8 @@ func main() {
 					case 1, 15: // YouTube / generic video (TV Audio HAL ~222 ms)
 						desiredStationMs = 218
 						desiredTvSpkMs = 0
-					case 2, 12: // Spotify pure audio (low-latency AudioTrack ~145 ms)
-						desiredStationMs = 145
+					case 2, 12: // Spotify pure audio (Spotify AudioTrack 44.1k large buffer = 732.65 ms in AudioFlinger)
+						desiredStationMs = 730
 						desiredTvSpkMs = 0
 					case 3, 7: // Twitch low latency (~135 ms)
 						desiredStationMs = 135
@@ -547,7 +547,7 @@ func main() {
 						desiredStationMs = 218
 						desiredTvSpkMs = 0
 					default:
-						if appHint >= 10 && appHint <= 70 {
+						if appHint >= 10 && appHint <= 95 {
 							desiredStationMs = appHint * 10
 						}
 					}
