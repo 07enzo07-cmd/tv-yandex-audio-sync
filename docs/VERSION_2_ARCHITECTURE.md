@@ -1,7 +1,7 @@
 # 🔊 TV to Yandex Station Audio Sync — Version 2.0 System Architecture
 
 **Document Version:** 2.0  
-**Target Hardware:** Vivax Smart TV (Android 11, MediaTek MT9612/MT9638 SoC) & Yandex Station Mini 2 (Amlogic A113X, Linux ARMv7)  
+**Target Hardware:** Vivax Smart TV (Android 11, MediaTek MT9612/MT9638 SoC, Vewd OS) & Yandex Station Mini 2 (Amlogic A113X, Linux ARMv7)  
 **Primary Repository:** `/Users/leo/tv-yandex-audio-sync`  
 **Protocol Revision:** UDP Sync Protocol v2 (Zero-Profile Header + SACK Telemetry)
 
@@ -237,3 +237,22 @@ tv-yandex-audio-sync/
     ├── build.sh                   # Go cross-compilation (GOARCH=arm GOARM=7)
     └── deploy.sh                  # Atomic deployment script with SIGTERM graceful restart
 ```
+
+---
+
+## 7. Reference Test Rig & Compatibility Caveats
+
+### 7.1 Author's Test Setup
+- **Television:** Vivax Smart TV running Android TV 11 on the Vewd OS / Leanback software stack, powered by a MediaTek MT9612/MT9638 SoC. Audio output is routed to internal TV stereo speakers via MediaTek HAL `AudioOut_D` with active Dolby Atmos Audio Processing (`speaker_audio_delay = 0`).
+- **Speaker:** Yandex Station Mini 2 (model YNDX-00021, Amlogic A113X, Linux ARMv7 32-bit userland) with root access.
+- **Listening Environment:** The Station is placed on the couch at head height, approximately 2.4 meters line-of-sight from the television screen (7.0 ms acoustic air-flight latency). Test volume is 4–8 on the TV scale.
+
+### 7.2 Compatibility Disclaimer for Other Setups
+> [!IMPORTANT]
+> The timing parameters, default baseline delay (170–175 ms), and acoustic reflection thresholds were empirically calibrated for the **Vivax (Android 11, Vewd / MediaTek) + Yandex Station Mini 2** reference environment.
+> 
+> If you deploy this project on a different television brand (such as TCL, Xiaomi / Mi TV, Philips, Sony, or Hisense) or with a different SoC (Amlogic, Realtek, Novatek):
+> 1. **Hardware HAL Latency:** Internal TV audio pipeline delay (`AudioOut_D` / AudioFlinger driver buffers) varies substantially across manufacturers (typically ranging from 80 ms to 220+ ms).
+> 2. **Room Acoustics:** Different listening distances and room reflection profiles change the acoustic time-of-flight.
+> 
+> **Adaptation Guideline:** When porting to a new environment, determine your baseline TV delay using the clean silence probe or set an initial estimate in `/data/audiosync/delay_ms` on the Station. The closed-loop consensus controller will then autonomously maintain sub-millisecond synchronization around that operating point.
