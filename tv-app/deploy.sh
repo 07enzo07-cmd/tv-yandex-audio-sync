@@ -29,13 +29,10 @@ echo "Подключение к $TV_IP:5555..."
 $ADB connect "$TV_IP:5555" || true
 
 echo "Установка APK..."
-$ADB -s "$TV_IP:5555" shell "rm -rf /data/data/com.spotify.tv.android/cache/* /data/local/tmp/*.tar 2>/dev/null; pm trim-caches 1000M 2>/dev/null || true"
 $ADB -s "$TV_IP:5555" install --no-incremental -r -g TvAudioSync.apk
 
 echo "Выдача фоновых разрешений (AppOps)..."
 $ADB -s "$TV_IP:5555" shell appops set dev.antigravity.audiosync PROJECT_MEDIA allow
-$ADB -s "$TV_IP:5555" shell appops set dev.antigravity.audiosync GET_USAGE_STATS allow 2>/dev/null || true
-$ADB -s "$TV_IP:5555" shell appops set dev.antigravity.audiosync PACKAGE_USAGE_STATS allow 2>/dev/null || true
 $ADB -s "$TV_IP:5555" shell appops set dev.antigravity.audiosync SYSTEM_ALERT_WINDOW allow
 $ADB -s "$TV_IP:5555" shell pm grant dev.antigravity.audiosync android.permission.WRITE_SECURE_SETTINGS 2>/dev/null || true
 

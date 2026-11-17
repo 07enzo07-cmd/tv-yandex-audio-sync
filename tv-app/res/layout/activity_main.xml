@@ -73,7 +73,7 @@
                 android:padding="8dp"
                 android:focusable="true"
                 android:nextFocusUp="@+id/btnToggle"
-                android:nextFocusDown="@+id/btnDelayReset"
+                android:nextFocusDown="@+id/btnPresetAtmos"
                 android:inputType="text" />
         </LinearLayout>
 
@@ -87,7 +87,7 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Ручная микроподстройка задержки (для всех приложений):"
+            android:text="Синхронизация звука"
             android:textColor="#DDDDDD"
             android:textSize="15sp"
             android:textStyle="bold"
@@ -97,62 +97,10 @@
             android:id="@+id/tvDelayInfo"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Смещение: 0 мс (YouTube: 140 мс, Кинопаб: 60 мс, Spotify: 60 мс, Twitch: 60 мс)"
+            android:text="Ожидание данных Станции"
             android:textColor="#00E5FF"
             android:textSize="14sp"
             android:layout_marginBottom="12dp" />
-
-        <LinearLayout
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center"
-            android:layout_marginBottom="16dp">
-
-            <Button
-                android:id="@+id/btnDelayMinus"
-                android:layout_width="110dp"
-                android:layout_height="44dp"
-                android:text="- 10 мс"
-                android:textSize="14sp"
-                android:textStyle="bold"
-                android:background="@drawable/btn_action"
-                android:textColor="@color/btn_action_text"
-                android:focusable="true"
-                android:nextFocusUp="@+id/etIp"
-                android:nextFocusDown="@+id/btnPresetAtmos"
-                android:nextFocusRight="@+id/btnDelayReset"
-                android:layout_marginEnd="12dp" />
-
-            <Button
-                android:id="@+id/btnDelayReset"
-                android:layout_width="100dp"
-                android:layout_height="44dp"
-                android:text="Сброс (0)"
-                android:textSize="13sp"
-                android:background="@drawable/btn_reset"
-                android:textColor="@color/btn_reset_text"
-                android:focusable="true"
-                android:nextFocusUp="@+id/etIp"
-                android:nextFocusDown="@+id/btnPresetAtmos"
-                android:nextFocusLeft="@+id/btnDelayMinus"
-                android:nextFocusRight="@+id/btnDelayPlus"
-                android:layout_marginEnd="12dp" />
-
-            <Button
-                android:id="@+id/btnDelayPlus"
-                android:layout_width="110dp"
-                android:layout_height="44dp"
-                android:text="+ 10 мс"
-                android:textSize="14sp"
-                android:textStyle="bold"
-                android:background="@drawable/btn_action"
-                android:textColor="@color/btn_action_text"
-                android:focusable="true"
-                android:nextFocusUp="@+id/etIp"
-                android:nextFocusDown="@+id/btnPresetAtmos"
-                android:nextFocusLeft="@+id/btnDelayReset" />
-        </LinearLayout>
 
         <View
             android:layout_width="650dp"
@@ -197,7 +145,7 @@
                 android:background="@drawable/btn_action"
                 android:textColor="@color/btn_action_text"
                 android:focusable="true"
-                android:nextFocusUp="@+id/btnDelayReset"
+                android:nextFocusUp="@+id/etIp"
                 android:nextFocusDown="@+id/btnModSurroundVirt"
                 android:nextFocusRight="@+id/btnPresetReset"
                 android:layout_marginEnd="16dp" />
@@ -211,7 +159,7 @@
                 android:background="@drawable/btn_reset"
                 android:textColor="@color/btn_reset_text"
                 android:focusable="true"
-                android:nextFocusUp="@+id/btnDelayReset"
+                android:nextFocusUp="@+id/etIp"
                 android:nextFocusDown="@+id/btnModSurroundVirt"
                 android:nextFocusLeft="@+id/btnPresetAtmos" />
         </LinearLayout>

@@ -21,10 +21,6 @@ public class MainActivity extends Activity {
     private EditText etIp;
     private Button btnToggle;
     private TextView tvDelayInfo;
-    private Button btnDelayMinus;
-    private Button btnDelayReset;
-    private Button btnDelayPlus;
-    private int currentOffset = 0;
     private boolean isAutoStart = false;
 
     private static class SoundModule {
@@ -69,46 +65,10 @@ public class MainActivity extends Activity {
         etIp = findViewById(R.id.etIp);
         btnToggle = findViewById(R.id.btnToggle);
         tvDelayInfo = findViewById(R.id.tvDelayInfo);
-        btnDelayMinus = findViewById(R.id.btnDelayMinus);
-        btnDelayReset = findViewById(R.id.btnDelayReset);
-        btnDelayPlus = findViewById(R.id.btnDelayPlus);
 
         final android.content.SharedPreferences prefs = getSharedPreferences("audiosync", Context.MODE_PRIVATE);
         String savedIp = prefs.getString("station_ip", "192.168.1.132");
         etIp.setText(savedIp);
-
-        updateDelayInfo(prefs);
-
-        btnDelayMinus.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                if (currentOffset > -100) {
-                    currentOffset -= 10;
-                    prefs.edit().putInt("delay_offset", currentOffset).apply();
-                    updateDelayInfo(prefs);
-                }
-            }
-        });
-
-        btnDelayReset.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                currentOffset = 0;
-                prefs.edit().putInt("delay_offset", currentOffset).apply();
-                updateDelayInfo(prefs);
-            }
-        });
-
-        btnDelayPlus.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                if (currentOffset < 100) {
-                    currentOffset += 10;
-                    prefs.edit().putInt("delay_offset", currentOffset).apply();
-                    updateDelayInfo(prefs);
-                }
-            }
-        });
 
         initSoundModuleViews();
 
@@ -254,6 +214,10 @@ public class MainActivity extends Activity {
 
     private void setGlobalAudioSetting(String key, int val) {
         try {
+            if (DspPreferences.isProtected(key)) {
+                DspPreferences.choose(this, key, val);
+                return;
+            }
             Settings.Global.putInt(getContentResolver(), key, val);
             Log.i(TAG, "setGlobalAudioSetting: " + key + " = " + val + " (via Settings.Global)");
         } catch (Throwable t) {
@@ -269,20 +233,15 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        final android.content.SharedPreferences prefs = getSharedPreferences("audiosync", Context.MODE_PRIVATE);
-        updateDelayInfo(prefs);
+        updateDelayInfo();
         updateUI();
         updateAllSoundModuleButtons();
     }
 
-    private void updateDelayInfo(android.content.SharedPreferences prefs) {
-        currentOffset = prefs.getInt("delay_offset", 0);
-        AudioSyncService.globalDelayOffsetMs = currentOffset;
-        String sign = currentOffset > 0 ? "+" : "";
-        if (tvDelayInfo != null) {
-            tvDelayInfo.setText(String.format("Ручная поправка ТВ: %s%d мс | Авто-синхр: Станция %d мс, ТВ %d мс (ошибка %.1f мс)",
-                    sign, currentOffset, AudioSyncService.liveStationDelayMs, AudioSyncService.liveTvSpeakerDelayMs, AudioSyncService.liveAcousticErrMs));
-        }
+    private void updateDelayInfo() {
+        tvDelayInfo.setText(AudioSyncService.isRunning && AudioSyncService.liveStationDelayMs > 0
+                ? "Уставка Станции: " + AudioSyncService.liveStationDelayMs + " мс"
+                : "Ожидание данных Станции");
     }
 
     private void updateUI() {

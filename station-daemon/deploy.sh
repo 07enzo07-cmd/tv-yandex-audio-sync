@@ -30,12 +30,21 @@ $ADB connect "$STATION_IP:5555" || true
 
 echo "Копирование бинарника..."
 $ADB -s "$STATION_IP:5555" shell mkdir -p /data/audiosync
-$ADB -s "$STATION_IP:5555" shell "killall -9 station-rx aplay 2>/dev/null || true"
-$ADB -s "$STATION_IP:5555" push station-rx /data/audiosync/station-rx
-$ADB -s "$STATION_IP:5555" shell chmod +x /data/audiosync/station-rx
-
-echo "Перезапуск демона на Станции..."
-$ADB -s "$STATION_IP:5555" shell "start-stop-daemon -S -b -x /data/audiosync/station-rx"
-
-echo "=== Развертывание на Станцию успешно завершено! ==="
-$ADB -s "$STATION_IP:5555" shell "ps | grep station-rx"
+device="$STATION_IP:5555"
+$ADB -s "$device" push station-rx /data/audiosync/station-rx.new
+$ADB -s "$device" shell 'set -e
+cd /data/audiosync
+chmod 755 station-rx.new
+mv -f station-rx.new station-rx
+old=$(pidof station-rx || true)
+if [ -n "$old" ]; then
+    kill -TERM $old
+    for i in 1 2 3 4 5; do
+        pidof station-rx >/dev/null || break
+        sleep 1
+    done
+    if pidof station-rx >/dev/null; then exit 1; fi
+fi
+/etc/init.d/S99station-rx start
+sleep 1
+pidof station-rx'

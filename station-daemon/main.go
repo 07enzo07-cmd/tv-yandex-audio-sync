@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,9 +32,9 @@ const (
 	// which provides a rock-solid 48 ms jitter cushion with 0 stalls, 0 drops, and 0 underruns,
 	// while naturally matching the TV's acoustic latency (MediaTek Audio HAL + Dolby Atmos + air travel).
 	alsaBaseMs   = 70.0
-	minStationMs = 70   // Physical minimum stable latency of Station (4096B pipe + 2880 buffer)
-	maxStationMs = 950  // Maximum allowed Station buffer delay (supports deep-buffer streaming & video)
-	geomAirMs    = 7.0  // Acoustic time-of-flight from TV to Station microphones (~2.4 meters)
+	minStationMs = 70  // Physical minimum stable latency of Station (4096B pipe + 2880 buffer)
+	maxStationMs = 950 // Maximum allowed Station buffer delay (supports deep-buffer streaming & video)
+	geomAirMs    = 7.0 // Acoustic time-of-flight from TV to Station microphones (~2.4 meters)
 )
 
 func getInitialDelayMs() int {
@@ -92,13 +93,7 @@ func isAcousticAutoEnabled() bool {
 	return str != "0" && !strings.EqualFold(str, "false")
 }
 
-func checkManualCommands(
-	curStationMs int,
-	setStationDelay func(int),
-	player *Player,
-	acoustic *AcousticEstimator,
-	atomicStationVol *int64,
-) {
+func checkManualStep(curStationMs int, setStationDelay func(int)) {
 	// 1. Manual Step: /data/audiosync/cmd_step
 	if data, err := os.ReadFile("/data/audiosync/cmd_step"); err == nil {
 		_ = os.Remove("/data/audiosync/cmd_step")
@@ -117,43 +112,16 @@ func checkManualCommands(
 		}
 	}
 
-	// 2. Clean Probe: /data/audiosync/cmd_probe
-	if _, err := os.Stat("/data/audiosync/cmd_probe"); err == nil {
-		_ = os.Remove("/data/audiosync/cmd_probe")
-		fmt.Fprintf(os.Stderr, "[diag-cmd] CLEAN SILENCE PROBE TRIGGERED...\n")
-		// Measure Station speaker playback lag before muting
-		preRes := acoustic.AnalyzeRoomSync(600, float64(curStationMs))
-		measuredSpkLag := preRes.SpkLagMs
-
-		// Mute Station speaker via amixer so TV is heard in complete isolation
-		_ = exec.Command("amixer", "set", "Master", "0%").Run()
-		time.Sleep(1200 * time.Millisecond) // Allow entire 1000 ms ring buffer to clear of Station sound
-
-		probeRes := acoustic.AnalyzeRoomSync(1000, float64(curStationMs))
-
-		// Restore Station volume
-		stVol := int(atomic.LoadInt64(atomicStationVol))
-		targetPct := stVol * 10
-		if targetPct <= 0 {
-			targetPct = 50
-		} else if targetPct > 100 {
-			targetPct = 100
-		}
-		_ = exec.Command("amixer", "set", "Master", fmt.Sprintf("%d%%", targetPct)).Run()
-
-		errMsec := probeRes.TvLagMs - measuredSpkLag
-		fmt.Fprintf(os.Stderr, "[diag-cmd] CLEAN PROBE RESULT: status=%s tv_lag=%.1f ms spk_lag=%.1f ms mismatch=%.1f ms tv_mag=%.4f tv_psr=%.1f valid=%v\n",
-			probeRes.Status, probeRes.TvLagMs, measuredSpkLag, errMsec, probeRes.TvMag, probeRes.TvPsr, probeRes.Valid)
-	}
 }
 
 type Player struct {
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	pipeFd  uintptr
-	pid     int
-	running bool
+	writeSince time.Time
+	mu         sync.Mutex
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	pipeFd     uintptr
+	pid        int
+	running    bool
 }
 
 func (p *Player) Start() error {
@@ -163,6 +131,7 @@ func (p *Player) Start() error {
 	defer p.mu.Unlock()
 
 	cmd := exec.Command("/usr/bin/aplay", "-D", "default", "--buffer-size=2880", "--period-size=960", "-R", "20000", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "2", "-q", "-")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -211,9 +180,15 @@ func (p *Player) Write(data []byte) error {
 		return fmt.Errorf("player not running")
 	}
 	w := p.stdin
+	p.writeSince = time.Now()
 	p.mu.Unlock()
 
 	_, err := w.Write(data)
+	p.mu.Lock()
+	if p.stdin == w {
+		p.writeSince = time.Time{}
+	}
+	p.mu.Unlock()
 	return err
 }
 
@@ -224,6 +199,7 @@ func (p *Player) Stop() {
 		return
 	}
 	p.running = false
+	p.writeSince = time.Time{}
 	w := p.stdin
 	p.stdin = nil
 	p.pipeFd = 0
@@ -254,13 +230,19 @@ func (p *Player) Stop() {
 			case <-time.After(100 * time.Millisecond):
 				if pid > 0 {
 					_ = syscall.Kill(pid, syscall.SIGKILL)
-					_ = exec.Command("ipcrm", "-S", "1024").Run()
-					_ = exec.Command("ipcrm", "-M", "1024").Run()
-					_ = exec.Command("ipcrm", "-M", "1025").Run()
 				}
 				<-done
 			}
 		}
+	}
+}
+
+func (p *Player) recoverBlockedWrite() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.running && !p.writeSince.IsZero() && time.Since(p.writeSince) > 750*time.Millisecond {
+		_ = p.cmd.Process.Signal(syscall.SIGINT)
+		p.writeSince = time.Now()
 	}
 }
 
@@ -304,6 +286,25 @@ func expandChunk481(src []byte, dst []byte) []byte {
 	return dst[0:1924]
 }
 
+// Gradually change the queue using continuous PCM, with fixed block endpoints.
+func retimeChunk(src, dst []byte, frames int) []byte {
+	for j := 0; j < frames; j++ {
+		pos := j * 479
+		i := pos / (frames - 1)
+		frac := pos % (frames - 1)
+		next := i + 1
+		if next > 479 {
+			next = 479
+		}
+		for ch := 0; ch < 2; ch++ {
+			a := int(int16(binary.LittleEndian.Uint16(src[i*4+ch*2:])))
+			b := int(int16(binary.LittleEndian.Uint16(src[next*4+ch*2:])))
+			binary.LittleEndian.PutUint16(dst[j*4+ch*2:], uint16(int16(a+(b-a)*frac/(frames-1))))
+		}
+	}
+	return dst[:frames*4]
+}
+
 // targetQueueChunksForDelay returns the target number of 10 ms chunks in the Go queue.
 // With alsaBaseMs = 100.0 ms (80 ms ALSA buffer + hardware/driver baseline):
 // - delayMs = 148 ms -> 4.8 chunks in Go queue (~48 ms jitter cushion)
@@ -327,11 +328,6 @@ func main() {
 		os.Stderr = logFile
 	}
 
-	_ = exec.Command("killall", "-9", "aplay").Run()
-	_ = exec.Command("ipcrm", "-S", "1024").Run()
-	_ = exec.Command("ipcrm", "-M", "1024").Run()
-	_ = exec.Command("ipcrm", "-M", "1025").Run()
-
 	addr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:"+port)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ResolveUDPAddr error: %v\n", err)
@@ -347,6 +343,9 @@ func main() {
 	_ = conn.SetReadBuffer(524288)
 
 	player := &Player{}
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+	go func() { <-stop; player.Stop(); os.Exit(0) }()
 	acoustic := NewAcousticEstimator()
 	acoustic.StartPassiveDmaReader()
 
@@ -357,7 +356,7 @@ func main() {
 	var atomicTargetDelay int64 = int64(getInitialDelayMs())
 	var atomicTvSpeakerDelay int64 = 0
 	var atomicTvVolume int64 = 8
-	var atomicStationVolume int64 = 5
+
 	var atomicIsMuted int64 = 0
 	var atomicTargetQBits uint64
 
@@ -422,7 +421,8 @@ func main() {
 
 	var lastPacketNano int64
 	var lastSeq uint32
-	var hasSeq bool
+	var playbackEpoch atomic.Uint64
+
 	var lastStationVol int = -1
 	var lastMuted bool = false
 	var hasVol bool = false
@@ -431,6 +431,7 @@ func main() {
 	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		for range ticker.C {
+			player.recoverBlockedWrite()
 			last := atomic.LoadInt64(&lastPacketNano)
 			if last == 0 {
 				continue
@@ -446,161 +447,83 @@ func main() {
 					}
 				}
 				atomic.StoreInt64(&silenceDebt, 0)
-				hasSeq = false
+
 			}
 		}
 	}()
 
 	// 2. Closed-Loop Autonomous Universal Acoustic Controller (Zero Profiles, Zero App Corridors)
 	go func() {
-		var confirmCount int
-		var lastSign int
-		var smoothedErr float64
-		var shiftConfirmCount int
-		var lastShiftTarget int
-
-		ticker := time.NewTicker(1500 * time.Millisecond)
-		for range ticker.C {
-			if !player.IsRunning() || atomic.LoadUint64(&acoustic.packetsRx) < 100 {
-				confirmCount = 0
-				smoothedErr = 0
-				shiftConfirmCount = 0
+		var evidence [6]float64
+		var nEvidence, head int
+		var settleUntil time.Time
+		var seenEpoch uint64
+		for range time.NewTicker(700 * time.Millisecond).C {
+			epoch := playbackEpoch.Load()
+			if epoch != seenEpoch {
+				nEvidence = 0
+				settleUntil = time.Now().Add(900 * time.Millisecond)
+				seenEpoch = epoch
+			}
+			if !player.IsRunning() || atomic.LoadInt64(&atomicTvVolume) < 1 || atomic.LoadInt64(&atomicIsMuted) != 0 || time.Now().Before(settleUntil) {
+				nEvidence = 0
 				continue
 			}
-
-			// Strict Volume Rule:
-			// Auto-sync is active ONLY when TV volume >= 4 and unmuted.
-			// When TV volume <= 3 (or muted), auto-sync sleeps and holds the last calibrated delay.
-			tvVol := int(atomic.LoadInt64(&atomicTvVolume))
-			isMuted := atomic.LoadInt64(&atomicIsMuted) != 0
-			if tvVol < 4 || isMuted {
-				confirmCount = 0
-				smoothedErr = 0
-				shiftConfirmCount = 0
+			target := int(atomic.LoadInt64(&atomicTargetDelay))
+			checkManualStep(target, setStationDelay)
+			target = int(atomic.LoadInt64(&atomicTargetDelay))
+			r := acoustic.AnalyzeRoomSync(1000, float64(target))
+			if r.Valid {
+				fmt.Fprintf(os.Stderr, "[measure] epoch=%d tv=%.1f station=%.1f error=%.1f quality=%.2f psr=%.1f contrast=%.2f mag=%.4f valid=%t target=%d\n", epoch, r.TvLagMs, r.SpkLagMs, r.AcousticErr, r.TvConf, r.TvPsr, r.Ratio, r.TvMag, r.Valid, target)
+			}
+			if !isAcousticAutoEnabled() || epoch != playbackEpoch.Load() {
+				nEvidence = 0
 				continue
 			}
-
-			curStationMs := int(atomic.LoadInt64(&atomicTargetDelay))
-			curTvSpkMs := int(atomic.LoadInt64(&atomicTvSpeakerDelay))
-
-			checkManualCommands(curStationMs, setStationDelay, player, acoustic, &atomicStationVolume)
-			curStationMs = int(atomic.LoadInt64(&atomicTargetDelay))
-
-			res := acoustic.AnalyzeRoomSync(1200, float64(curStationMs))
-
-			fmt.Fprintf(os.Stderr, "[diag-obs] status=%s tv_lag=%.1f ms spk_lag=%.1f ms err=%.1f ms conf=%.2f spk_mag=%.4f tv_mag=%.4f ratio=%.3f psr=%.1f st_delay=%d ms\n",
-				res.Status, res.TvLagMs, res.SpkLagMs, res.AcousticErr, res.TvConf, res.SpkMag, res.TvMag, res.Ratio, res.TvPsr, curStationMs)
-
-			if isObservationMode() {
-				// Closed loop delay adjustment is frozen in Observation Mode.
+			sample := math.NaN()
+			if r.Valid && math.Abs(r.AcousticErr) > 8 {
+				sample = r.AcousticErr
+			}
+			evidence[head] = sample
+			head = (head + 1) % len(evidence)
+			if nEvidence < len(evidence) {
+				nEvidence++
+			}
+			if math.IsNaN(sample) {
 				continue
 			}
-
-			if !res.Valid {
-				continue
-			}
-
-			// True acoustic mismatch in listening room:
-			// errMs > 0 -> TV speakers are LATER than Station (need more Station delay)
-			// errMs < 0 -> TV speakers are EARLIER than Station (need less Station delay)
-			errMs := res.AcousticErr
-
-			fmt.Fprintf(os.Stderr, "[acoustic-sync] Telemetry: tv_lag=%.1f ms, spk_lag=%.1f ms, err=%.1f ms, conf=%.2f, st_delay=%d ms, tv_spk_delay=%d ms\n",
-				res.TvLagMs, res.SpkLagMs, errMs, res.TvConf, curStationMs, curTvSpkMs)
-
-			if !isAcousticAutoEnabled() {
-				continue
-			}
-
-			// CASE 1: Large stream / app transition (e.g. YouTube ~220 ms <-> Spotify ~115 ms).
-			// Require |errMs| >= 40.0 ms, high confidence (>= 0.65), and 2 consecutive cycles agreeing within +/-20 ms!
-			if math.Abs(errMs) >= 40.0 && res.TvConf >= 0.65 {
-				proposedDelay := curStationMs + int(math.Round(errMs))
-				if proposedDelay < minStationMs {
-					proposedDelay = minStationMs
-				} else if proposedDelay > maxStationMs {
-					proposedDelay = maxStationMs
+			var votes int
+			var total float64
+			for k := 0; k < nEvidence; k++ {
+				v := evidence[(head+len(evidence)-1-k)%len(evidence)]
+				if math.Abs(v-sample) <= 9 {
+					votes++
+					total += v
 				}
-
-				if math.Abs(float64(proposedDelay-lastShiftTarget)) <= 20.0 {
-					shiftConfirmCount++
-				} else {
-					lastShiftTarget = proposedDelay
-					shiftConfirmCount = 1
-				}
-
-				if shiftConfirmCount >= 2 {
-					shiftConfirmCount = 0
-					if proposedDelay != curStationMs {
-						setStationDelay(proposedDelay)
-						fmt.Fprintf(os.Stderr, "[acoustic-sync] UNIVERSAL APP-SHIFT SNAP CONFIRMED (err=%.1f ms, conf=%.2f): Station %d -> %d ms\n",
-							errMs, res.TvConf, curStationMs, proposedDelay)
-					}
-					smoothedErr = 0
-					confirmCount = 0
-				}
-				continue
-			} else {
-				shiftConfirmCount = 0
 			}
-
-			// CASE 2: Fine tracking in near field.
-			// Haas acoustic deadband: ignore sub-3.5ms differences where wavefronts are acoustically fused.
-			if math.Abs(errMs) <= 3.5 {
-				smoothedErr = 0.5 * smoothedErr
+			if votes < 3 {
 				continue
 			}
-
-			if res.TvConf < 0.45 {
+			prior := total / float64(votes)
+			// A physical mismatch beyond both actuators cannot justify a jump to a rail.
+			if float64(target)+prior < 80-12 || float64(target)+prior > maxStationMs+12 {
 				continue
 			}
-
-			// EMA smoothing filter eliminates single-packet room reflection spikes
-			smoothedErr = 0.35*errMs + 0.65*smoothedErr
-			if math.Abs(smoothedErr) <= 3.5 {
+			step := math.Max(-60, math.Min(60, prior))
+			desired := target + int(math.Round(step))
+			if desired < 80 {
+				desired = 80
+			}
+			if desired > maxStationMs {
+				desired = maxStationMs
+			}
+			if desired == target {
 				continue
 			}
-
-			sign := 1
-			if smoothedErr < 0 {
-				sign = -1
-			}
-			if sign == lastSign {
-				confirmCount++
-			} else {
-				lastSign = sign
-				confirmCount = 1
-			}
-
-			// Require 2 consecutive smoothed measurements of the same sign before micro-adjusting
-			if confirmCount >= 2 {
-				confirmCount = 0
-				deltaMs := int(math.Round(smoothedErr * 0.45))
-				if deltaMs > 15 {
-					deltaMs = 15
-				} else if deltaMs < -15 {
-					deltaMs = -15
-				}
-
-				newStationMs := curStationMs + deltaMs
-				if newStationMs < minStationMs {
-					newStationMs = minStationMs
-				} else if newStationMs > maxStationMs {
-					newStationMs = maxStationMs
-				}
-				newTvSpkMs := 0 // Keep TV speaker delay strictly 0 ms for zero lip-sync degradation
-
-				if newStationMs != curStationMs {
-					setStationDelay(newStationMs)
-				}
-				if newTvSpkMs != curTvSpkMs {
-					sendTvSpeakerDelay(newTvSpkMs)
-				}
-				smoothedErr = 0
-				confirmCount = 0
-				fmt.Fprintf(os.Stderr, "[acoustic-sync] AUTO-LOCK applied (err=%.1f ms, conf=%.2f): Station %d->%d ms, TV_spk %d->%d ms\n",
-					errMs, res.TvConf, curStationMs, newStationMs, curTvSpkMs, newTvSpkMs)
-			}
+			setStationDelay(desired)
+			fmt.Fprintf(os.Stderr, "[confirmed] epoch=%d target=%d -> %d measured=%.1f\n", epoch, target, desired, prior)
+			nEvidence = 0
+			settleUntil = time.Now().Add(1600 * time.Millisecond)
 		}
 	}()
 
@@ -609,13 +532,28 @@ func main() {
 		ticker := time.NewTicker(2 * time.Second)
 		for range ticker.C {
 			if player.IsRunning() {
-				sendTvSpeakerDelay(int(atomic.LoadInt64(&atomicTvSpeakerDelay)))
+				requested := 0
+				if data, err := os.ReadFile("/tmp/audiosync-tv-delay-test"); err == nil {
+					fields := strings.Fields(string(data))
+					if len(fields) == 2 {
+						ms, e1 := strconv.Atoi(fields[0])
+						until, e2 := strconv.ParseInt(fields[1], 10, 64)
+						remaining := until - time.Now().Unix()
+						if e1 == nil && e2 == nil && ms >= 0 && ms <= 80 && remaining > 0 && remaining <= 60 {
+							requested = ms
+						}
+					}
+				}
+				sendTvSpeakerDelay(requested)
 			}
 		}
 	}()
 
 	// 3. UDP Receiver Goroutine
 	go func() {
+
+		quietPackets := 0
+		hasSeq := false
 		buf := make([]byte, 4096)
 		for {
 			n, srcAddr, err := conn.ReadFromUDP(buf)
@@ -623,7 +561,10 @@ func main() {
 				continue
 			}
 			nowNano := time.Now().UnixNano()
-			atomic.StoreInt64(&lastPacketNano, nowNano)
+			if nowNano-atomic.SwapInt64(&lastPacketNano, nowNano) > int64(1500*time.Millisecond) {
+				hasSeq = false
+				playbackEpoch.Add(1)
+			}
 			atomic.AddUint64(&rxPkts, 1)
 
 			if srcAddr != nil {
@@ -642,7 +583,7 @@ func main() {
 				isMuted := buf[14] != 0
 
 				atomic.StoreInt64(&atomicTvVolume, int64(tvVol))
-				atomic.StoreInt64(&atomicStationVolume, int64(stationVol))
+
 				if isMuted {
 					atomic.StoreInt64(&atomicIsMuted, 1)
 				} else {
@@ -690,6 +631,26 @@ func main() {
 
 			// Record reference audio monotonically!
 			acoustic.FeedUdpReferenceChunk48k(pcm)
+			var peak int
+			for i := 0; i+1 < len(pcm); i += 2 {
+				v := int(int16(binary.LittleEndian.Uint16(pcm[i:])))
+				if v < 0 {
+					v = -v
+				}
+				if v > peak {
+					peak = v
+				}
+			}
+			if peak <= 12 {
+				if quietPackets < 1000 {
+					quietPackets++
+				}
+			} else {
+				if quietPackets >= 12 || isMajorSeek || !hasSeq {
+					playbackEpoch.Add(1)
+				}
+				quietPackets = 0
+			}
 
 			if isMajorSeek && player.IsRunning() {
 				atomic.AddUint64(&resyncEvents, 1)
@@ -778,6 +739,13 @@ func main() {
 			continue
 		}
 
+		for len(queue) > primeCount {
+			select {
+			case <-queue:
+				atomic.AddUint64(&droppedPkts, 1)
+			default:
+			}
+		}
 		atomic.StoreInt64(&silenceDebt, 0)
 		if err := player.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "[station-rx] aplay start failed: %v\n", err)
@@ -785,48 +753,9 @@ func main() {
 			continue
 		}
 
-		// Initial Silence Window Probe (800 ms):
-		// Feed silence chunks into aplay so Station speaker remains 100% silent while TV begins playing.
-		// Station microphones capture pure TV room arrival with zero speaker loopback interference.
-		probeDone := false
-		for p := 0; p < 80; p++ {
-			_ = player.Write(silenceChunk)
-			time.Sleep(10 * time.Millisecond)
-
-			tvVol := int(atomic.LoadInt64(&atomicTvVolume))
-			isMuted := atomic.LoadInt64(&atomicIsMuted) != 0
-			// Run probe once at least 500 ms of audio has accumulated
-			if p >= 50 && tvVol >= 4 && !isMuted {
-				curStationMs := int(atomic.LoadInt64(&atomicTargetDelay))
-				res := acoustic.AnalyzeRoomSync(600, float64(curStationMs))
-				if res.Valid && res.TvConf >= 0.50 {
-					if !isObservationMode() {
-						initDelay := int(math.Round(res.TvLagMs - 19.0))
-						if initDelay < minStationMs {
-							initDelay = minStationMs
-						} else if initDelay > maxStationMs {
-							initDelay = maxStationMs
-						}
-						setStationDelay(initDelay)
-						fmt.Fprintf(os.Stderr, "[station-rx] Initial Silence Probe LOCKED TV: tv_lag=%.1f ms -> st_delay=%d ms (conf=%.2f)\n",
-							res.TvLagMs, initDelay, res.TvConf)
-					} else {
-						fmt.Fprintf(os.Stderr, "[station-rx] Initial Silence Probe MEASURED TV (ObsMode): tv_lag=%.1f ms, conf=%.2f, holding st_delay=%d ms\n",
-							res.TvLagMs, res.TvConf, curStationMs)
-					}
-					probeDone = true
-					break
-				}
-			}
-		}
-		if !probeDone {
-			fmt.Fprintf(os.Stderr, "[station-rx] Initial Silence Probe finished (using delay %d ms)\n",
-				atomic.LoadInt64(&atomicTargetDelay))
-		}
-
 		targetQ = getTargetQ()
 		emaQ := targetQ
-		lastTargetQ := targetQ
+		retimeBuf := make([]byte, (480+24)*4)
 		fmt.Fprintf(os.Stderr, "[station-rx] aplay started (pid %d) locked at %d ms (targetQ: %.1f, initial qlen: %d)\n",
 			player.pid, atomic.LoadInt64(&atomicTargetDelay), targetQ, len(queue))
 
@@ -836,35 +765,6 @@ func main() {
 			targetQ = getTargetQ()
 			pipeChunks := float64(player.PipeQueuedBytes()) / float64(chunkPcmLen)
 			curQ := float64(len(queue)) + pipeChunks
-
-			// Step-adjust queue only when targetQ was changed by >15 ms (>1.5 chunks)
-			if math.Abs(targetQ-lastTargetQ) > 1.5 {
-				if curQ > targetQ+2.0 {
-					select {
-					case <-queue:
-						atomic.AddUint64(&droppedPkts, 1)
-					default:
-					}
-					if curQ <= targetQ+2.0 {
-						lastTargetQ = targetQ
-						emaQ = targetQ
-					}
-				} else if curQ < targetQ-2.0 {
-					_ = player.Write(silenceChunk)
-					atomic.AddUint64(&duplicatePkts, 1)
-					time.Sleep(9 * time.Millisecond)
-					if curQ >= targetQ-2.0 {
-						lastTargetQ = targetQ
-						emaQ = targetQ
-					}
-					continue
-				} else {
-					lastTargetQ = targetQ
-					emaQ = targetQ
-				}
-			} else {
-				lastTargetQ = targetQ
-			}
 
 			// Paced drain if queue experiences large burst (>targetQ + 15 chunks = >150 ms backlog)
 			if curQ > targetQ+15.0 {
@@ -887,12 +787,15 @@ func main() {
 			case chunk := <-queue:
 				pipeChunks = float64(player.PipeQueuedBytes()) / float64(chunkPcmLen)
 				curQ = float64(len(queue)) + pipeChunks
-				emaQ = 0.005*curQ + 0.995*emaQ
+				emaQ = 0.03*curQ + 0.97*emaQ
 
 				errQ := emaQ - targetQ
 				out := chunk
 				// Smooth sub-millisecond linear interpolation PLL (deadband: ±0.8 chunks = ±8.0 ms)
-				if errQ > 0.8 && len(chunk) == chunkPcmLen {
+				if math.Abs(errQ) > 1.5 && len(chunk) == chunkPcmLen {
+					frames := 480 - int(math.Round(math.Max(-24, math.Min(24, errQ*3))))
+					out = retimeChunk(chunk, retimeBuf, frames)
+				} else if errQ > 0.8 && len(chunk) == chunkPcmLen {
 					out = shrinkChunk479(chunk, shrinkBuf)
 					atomic.AddUint64(&pllShrinks, 1)
 				} else if errQ < -0.8 && len(chunk) == chunkPcmLen {

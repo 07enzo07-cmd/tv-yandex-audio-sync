@@ -6,7 +6,6 @@ import (
 	"math"
 	"math/bits"
 	"os"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -39,13 +38,6 @@ const (
 	dmaMicsBytes  = dmaMicsFrames * 8 * 2
 	dmaSpkFrames  = 2048 // buffer_size=2048 frames, 2 channels, S16_LE (8192 B)
 	dmaSpkBytes   = dmaSpkFrames * 2 * 2
-
-	// NLMS Adaptive Acoustic Echo Canceller parameters (16 kHz):
-	// Cancels the Station's internal speaker AND couch/table reflections up to 16.0 ms using hardware loopback TODDR_B.
-	// 256 taps = 16.0 ms filter length: cancels enclosure resonance, plastic chassis AND couch reflections (3.9 ms).
-	nlmsFilterLen = 256
-	nlmsStepMu    = 0.05
-	nlmsEps       = 1e-4
 
 	// FFT size for GCC-PHAT cross-correlation:
 	// N = 32768 samples at 16 kHz = 2048 ms analysis window (covers lags up to ±1024 ms).
@@ -85,14 +77,8 @@ type AcousticEstimator struct {
 	refRing [historyFrames]float32
 
 	// 4 echo-cancelled microphone channels (after per-mic NLMS against spkLoopRing)
-	micCleanRing [4][historyFrames]float32
-	spkLoopRing  [historyFrames]float32
-
-	// Per-microphone NLMS adaptive filter weights (4 mics x 64 taps) and delay line
-	nlmsW    [4][nlmsFilterLen]float32
-	nlmsX    [nlmsFilterLen]float32
-	nlmsXPow float32
-	nlmsHead int
+	micRing     [4][historyFrames]float32
+	spkLoopRing [historyFrames]float32
 
 	// Pre-allocated FFT buffers to avoid GC pressure and keep CPU < 2%
 	fftA    []complex128
@@ -274,44 +260,16 @@ func (ae *AcousticEstimator) StartPassiveDmaReader() {
 						micVals[ch] = float32(mSum[ch]) / (3.0 * 32768.0)
 					}
 
-					// Fast recursive power calculation & delay line update
-					oldVal := ae.nlmsX[ae.nlmsHead]
-					ae.nlmsX[ae.nlmsHead] = spkVal
-					ae.nlmsXPow += spkVal*spkVal - oldVal*oldVal
-					if ae.nlmsXPow < nlmsEps {
-						ae.nlmsXPow = nlmsEps
-					}
-					normStep := float32(nlmsStepMu) / ae.nlmsXPow
-					adaptActive := ae.nlmsXPow > 1e-3
-
-					head := ae.nlmsHead
-					ae.nlmsHead = (ae.nlmsHead + 1) & (nlmsFilterLen - 1)
-
 					idx := pos & historyMask
 					ae.spkLoopRing[idx] = spkVal
-
-					var cleanAvg float32
+					var micEnergy float64
 					for ch := 0; ch < 4; ch++ {
-						var echoEst float32
-						w := &ae.nlmsW[ch]
-						for t := 0; t < nlmsFilterLen; t++ {
-							xIdx := (head - t + nlmsFilterLen) & (nlmsFilterLen - 1)
-							echoEst += w[t] * ae.nlmsX[xIdx]
-						}
-						errSig := micVals[ch] - echoEst
-						if adaptActive {
-							muErr := normStep * errSig
-							for t := 0; t < nlmsFilterLen; t++ {
-								xIdx := (head - t + nlmsFilterLen) & (nlmsFilterLen - 1)
-								w[t] += muErr * ae.nlmsX[xIdx]
-							}
-						}
-						ae.micCleanRing[ch][idx] = errSig
-						cleanAvg += errSig * 0.25
+						ae.micRing[ch][idx] = micVals[ch]
+						micEnergy += float64(micVals[ch] * micVals[ch])
 					}
 
 					pos++
-					micSqSum += float64(cleanAvg * cleanAvg)
+					micSqSum += micEnergy / 4
 					spkSqSum += float64(spkVal * spkVal)
 					outSamples++
 				}
@@ -380,7 +338,8 @@ func fftInPlace(a []complex128, invert bool) {
 // AnalyzeRoomSync runs regularized FFT-based GCC-PHAT over the latest windowSamples (e.g. 8192 samples = 512 ms)
 // completely passively without interrupting playback.
 func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayMs float64) AcousticResult {
-	var res AcousticResult
+	res := AcousticResult{Status: "UNOBSERVED"}
+	atomic.StoreInt64(&ae.lastConfidence, 0)
 	winSamples := windowMs * (decimRate / 1000)
 	if winSamples > fftSize/2 {
 		winSamples = fftSize / 2
@@ -435,7 +394,7 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 		mIdx := (startMicPos + uint64(i)) & historyMask
 		spkSlice[i] = ae.spkLoopRing[mIdx]
 		for ch := 0; ch < 4; ch++ {
-			mv := ae.micCleanRing[ch][mIdx]
+			mv := ae.micRing[ch][mIdx]
 			micSlices[ch][i] = mv
 			rawMicSq += float64(mv * mv)
 		}
@@ -446,7 +405,7 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 	// Sensitive enough for quiet Spotify music / dialogue at TV volume 4..6, while rejecting room silence
 	refRms := math.Sqrt(rawRefSq / float64(winSamples))
 	micRms := math.Sqrt(rawMicSq / float64(winSamples*4))
-	if refRms < 0.001 || micRms < 0.00008 {
+	if refRms < 0.001 || micRms < 0.00002 {
 		return res
 	}
 
@@ -468,7 +427,7 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 		micSlices[ch][0] = 0
 	}
 
-	if refEnergy < 0.0005 || micEnergy < 0.00005 {
+	if refEnergy < 0.0005 || micEnergy < 0.000005 {
 		return res
 	}
 
@@ -487,7 +446,7 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 	maxBin := (6000 * fftSize) / decimRate
 
 	// 2. Measure exact Station playback delay (refSlice -> spkSlice) via regularized GCC-PHAT
-	res.SpkLagMs = expectedStationDelayMs
+	res.SpkLagMs = 0
 	if spkEnergy >= 1e-4 {
 		for i := 0; i < fftSize; i++ {
 			if i < winSamples {
@@ -519,11 +478,11 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 		fftInPlace(ae.fftCorr, true)
 
 		// Search Station speaker hardware loopback within ±35 ms of expected Station buffer delay
-		minSpkSample := int((expectedStationDelayMs - 35.0) * 16.0)
+		minSpkSample := int((expectedStationDelayMs - 150.0) * 16.0)
 		if minSpkSample < 480 {
 			minSpkSample = 480
 		}
-		maxSpkSample := int((expectedStationDelayMs + 35.0) * 16.0)
+		maxSpkSample := int((expectedStationDelayMs + 180.0) * 16.0)
 		if maxSpkSample > fftSize/2 {
 			maxSpkSample = fftSize / 2
 		}
@@ -549,12 +508,24 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 		if res.SpkConf >= 0.50 {
 			res.SpkLagMs = float64(bestSpkSample) * 1000.0 / float64(decimRate)
 		} else {
-			res.SpkLagMs = expectedStationDelayMs
+			res.SpkLagMs = 0
 		}
 	}
 
-	// 3. Multi-microphone Regularized GCC-PHAT for TV arrival:
-	// Sum magnitude profiles across all 4 NLMS-cleaned mics with spectral regularization
+	if res.SpkConf < 0.65 {
+		return res
+	}
+	// For each microphone remove the near-field acoustic image of the hardware
+	// loopback. Fit a finite room impulse response on the complete audio window.
+	// Do not infer coincidence from the part of the signal removed by this fit.
+	direct := make([]complex128, fftSize)
+	copy(direct, ae.fftB)
+	var speakerPower float64
+	for k := minBin; k <= maxBin; k++ {
+		a := direct[k]
+		speakerPower += real(a)*real(a) + imag(a)*imag(a)
+	}
+	floor := 0.03*speakerPower/float64(maxBin-minBin+1) + 1e-9
 	for i := 0; i < fftSize; i++ {
 		ae.corrMag[i] = 0
 	}
@@ -570,6 +541,26 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 		}
 		fftInPlace(ae.fftB, false)
 
+		// Regularized transfer function mic / loopback, truncated to the causal
+		// near-field response. Farther peaks remain available for TV measurement.
+		for k := minBin; k <= maxBin; k++ {
+			b := direct[k]
+			m := ae.fftB[k]
+			h := m * complex(real(b), -imag(b)) / complex(real(b)*real(b)+imag(b)*imag(b)+floor, 0)
+			ae.fftCorr[k] = h
+			ae.fftCorr[fftSize-k] = complex(real(h), -imag(h))
+		}
+		fftInPlace(ae.fftCorr, true)
+		for j := 0; j < fftSize; j++ {
+			if j > 560 && j < fftSize-48 {
+				ae.fftCorr[j] = 0
+			}
+		}
+		fftInPlace(ae.fftCorr, false)
+		for k := minBin; k <= maxBin; k++ {
+			ae.fftB[k] -= direct[k] * ae.fftCorr[k]
+		}
+		clear(ae.fftCorr)
 		var sumCrossMag float64
 		for k := minBin; k <= maxBin; k++ {
 			ra := ae.fftA[k]
@@ -589,198 +580,77 @@ func (ae *AcousticEstimator) AnalyzeRoomSync(windowMs int, expectedStationDelayM
 			ae.fftCorr[fftSize-k] = complex(real(ae.fftCorr[k]), -imag(ae.fftCorr[k]))
 		}
 		fftInPlace(ae.fftCorr, true)
-		for s := 0; s < fftSize/2; s++ {
-			ae.corrMag[s] += math.Abs(real(ae.fftCorr[s])) * 0.25
+		for lag := -fftSize / 2; lag < fftSize/2; lag++ {
+			ae.corrMag[lag+fftSize/2] += math.Abs(real(ae.fftCorr[lag&(fftSize-1)])) * 0.25
 		}
 	}
-
-	// Universal Search Range for TV Acoustic Arrival:
-	// From 50 ms (800 samples) up to 920 ms (14720 samples).
-	// Zero app corridors, zero hardcoded profiles: covers low latency to deep-buffer streaming!
-	minSearchSample := int(50.0 * 16.0)
-	maxSearchSample := int(920.0 * 16.0)
-
-	type CorrPeak struct {
-		sample int
-		lagMs  float64
-		mag    float64
+	// Limit the search by usable linear overlap. Zero padding alone
+	// cannot supply missing reference history.
+	bound := winSamples - 2400
+	if bound <= 0 {
+		return res
 	}
-	var allPeaks []CorrPeak
-	for s := minSearchSample + 1; s < maxSearchSample; s++ {
-		if ae.corrMag[s] > ae.corrMag[s-1] && ae.corrMag[s] > ae.corrMag[s+1] && ae.corrMag[s] > 0.003 {
-			allPeaks = append(allPeaks, CorrPeak{
-				sample: s,
-				lagMs:  float64(s) * 1000.0 / 16000.0,
-				mag:    ae.corrMag[s],
-			})
-		}
-	}
-	sort.Slice(allPeaks, func(i, j int) bool {
-		return allPeaks[i].mag > allPeaks[j].mag
-	})
-	if len(allPeaks) > 0 {
-		topCount := len(allPeaks)
-		if topCount > 5 {
-			topCount = 5
-		}
-		peakLog := fmt.Sprintf("[corr-peaks] spkLag=%.1f ms | Top: ", res.SpkLagMs)
-		for i := 0; i < topCount; i++ {
-			peakLog += fmt.Sprintf("[%.1f ms (mag=%.4f)] ", allPeaks[i].lagMs, allPeaks[i].mag)
-		}
-		fmt.Fprintf(os.Stderr, "%s\n", peakLog)
-	}
-
-	spkCenterSample := int(math.Round(res.SpkLagMs * 16.0))
-	var bestTvSample int = -1
-	var maxTv float64
-	var psr float64
-
-	spkActive := spkEnergy >= 1e-4 && res.SpkConf >= 0.50
-
-	// Direct chassis coupling blanking around Station speaker:
-	// Blanking -3.0 ms (-48 samples) to +4.5 ms (+72 samples) around Station speaker arrival.
-	// This isolates the Station direct sound and cone ringdown without creating artificial blind spots.
-	chassisBlankStart := spkCenterSample - 48
-	chassisBlankEnd := spkCenterSample + 72
-
-	// Measure peak magnitude of Station speaker inside the direct window:
-	var spkDirectMag float64
-	if spkActive {
-		for s := chassisBlankStart; s <= chassisBlankEnd; s++ {
-			if s >= minSearchSample && s <= maxSearchSample {
-				if ae.corrMag[s] > spkDirectMag {
-					spkDirectMag = ae.corrMag[s]
-				}
-			}
-		}
-	}
-
-	// 1. Search for TV acoustic arrival across the entire 50..920 ms window
-	for s := minSearchSample; s <= maxSearchSample; s++ {
-		if spkActive && s >= chassisBlankStart && s <= chassisBlankEnd {
+	mid := fftSize / 2
+	// Only select peaks reachable by the current queue actuator. A repeated
+	// musical phrase may correlate very strongly a beat before the true arrival.
+	// Use the measured loopback and the current operating point, not an app hint.
+	lower := max(-bound, int(math.Ceil((res.SpkLagMs+80-expectedStationDelayMs-12)*16)))
+	upper := min(bound, int(math.Floor((res.SpkLagMs+maxStationMs-expectedStationDelayMs+12)*16)))
+	best := 0
+	found := false
+	for lag := lower; lag <= upper; lag++ {
+		delta := float64(lag)/16 - res.SpkLagMs
+		if delta >= -10 && delta <= 35 {
 			continue
 		}
-		v := ae.corrMag[s]
-		if v > maxTv {
-			maxTv = v
-			bestTvSample = s
+		if !found || ae.corrMag[mid+lag] > ae.corrMag[mid+best] {
+			best = lag
+			found = true
 		}
 	}
-
-	// 2. Measure Peak-to-Sidelobe Ratio (PSR) against background noise floor
-	if bestTvSample >= 0 && maxTv >= 0.018 {
-		var sumBg float64
-		var countBg int
-		for s := minSearchSample; s <= maxSearchSample; s++ {
-			if spkActive && s >= chassisBlankStart && s <= chassisBlankEnd {
-				continue
-			}
-			if s >= bestTvSample-128 && s <= bestTvSample+128 {
-				continue
-			}
-			sumBg += ae.corrMag[s]
-			countBg++
-		}
-		if countBg > 0 {
-			meanBg := sumBg / float64(countBg)
-			if meanBg > 1e-9 {
-				psr = maxTv / meanBg
-			}
-		}
+	if !found {
+		return res
 	}
-
-	// 3. Evaluate Room Sync State:
-	ratio := 0.0
-	if spkDirectMag > 1e-6 {
-		ratio = maxTv / spkDirectMag
+	peak := ae.corrMag[mid+best]
+	var sum, rival float64
+	var count int
+	for lag := lower; lag <= upper; lag++ {
+		delta := float64(lag)/16 - res.SpkLagMs
+		if (delta >= -10 && delta <= 35) || absLag(lag-best) <= 128 {
+			continue
+		}
+		v := ae.corrMag[mid+lag]
+		if v > rival {
+			rival = v
+		}
+		sum += v
+		count++
 	}
-	res.SpkMag = spkDirectMag
-	res.TvMag = maxTv
+	psr := peak / (sum/float64(count) + 1e-9)
 	res.TvPsr = psr
-	res.Ratio = ratio
-
-	isTvDistinct := bestTvSample >= 0 && maxTv >= 0.020 && psr >= 4.0
-
-	if spkActive {
-		// When Station speaker is actively playing in the room:
-		// Require TV peak to be genuinely distinct:
-		// 1) Absolute magnitude >= 0.020
-		// 2) PSR >= 4.0 (+12 dB above background floor)
-		// 3) Either TV is outside speaker blanking AND has sufficient power relative to leakage (ratio >= 0.25),
-		//    OR Station speaker is very quiet.
-		if isTvDistinct && ratio >= 0.25 {
-			// Direct line-of-sight path selection:
-			directWindowStart := bestTvSample - int(15.0*16.0)
-			if directWindowStart < minSearchSample {
-				directWindowStart = minSearchSample
-			}
-			thresh := 0.75 * maxTv
-			for s := directWindowStart; s < bestTvSample; s++ {
-				if s >= chassisBlankStart && s <= chassisBlankEnd {
-					continue
-				}
-				if ae.corrMag[s] >= thresh && ae.corrMag[s] > ae.corrMag[s-1] && ae.corrMag[s] > ae.corrMag[s+1] {
-					bestTvSample = s
-					maxTv = ae.corrMag[s]
-					break
-				}
-			}
-
-			res.TvLagMs = float64(bestTvSample) * 1000.0 / float64(decimRate)
-			res.AcousticErr = res.TvLagMs - res.SpkLagMs
-			res.TvConf = psr / 10.0
-			if res.TvConf > 1.0 {
-				res.TvConf = 1.0
-			}
-			res.Valid = true
-			res.Status = "TV_DETECTED"
-		} else {
-			// TV is NOT distinguishable!
-			// DO NOT FABRICATE ZERO ERROR!
-			res.TvLagMs = float64(bestTvSample) * 1000.0 / float64(decimRate)
-			res.AcousticErr = 0.0
-			res.TvConf = 0.0
-			res.Valid = false
-			res.Status = "TV_NOT_DISTINGUISHABLE"
-		}
-	} else {
-		// Station speaker is SILENT (Clean Silence Probe or quiet passage):
-		// No Station speaker loopback interference at all!
-		if isTvDistinct {
-			directWindowStart := bestTvSample - int(15.0*16.0)
-			if directWindowStart < minSearchSample {
-				directWindowStart = minSearchSample
-			}
-			thresh := 0.75 * maxTv
-			for s := directWindowStart; s < bestTvSample; s++ {
-				if ae.corrMag[s] >= thresh && ae.corrMag[s] > ae.corrMag[s-1] && ae.corrMag[s] > ae.corrMag[s+1] {
-					bestTvSample = s
-					maxTv = ae.corrMag[s]
-					break
-				}
-			}
-
-			res.TvLagMs = float64(bestTvSample) * 1000.0 / float64(decimRate)
-			res.AcousticErr = 0.0
-			res.TvConf = psr / 10.0
-			if res.TvConf > 1.0 {
-				res.TvConf = 1.0
-			}
-			res.Valid = true
-			res.Status = "CLEAN_PROBE_TV_LOCKED"
-		} else {
-			res.TvLagMs = float64(bestTvSample) * 1000.0 / float64(decimRate)
-			res.Valid = false
-			res.Status = "TV_NOT_DISTINGUISHABLE"
-		}
+	res.Ratio = peak / (rival + 1e-9)
+	res.TvMag = peak
+	res.TvLagMs = float64(best) / 16
+	if peak < 0.001 || psr < 7 || peak < 1.16*rival {
+		return res
 	}
-
-	if res.Valid {
-		atomic.StoreInt64(&ae.lastTvLagTenthsMs, int64(math.Round(res.TvLagMs*10)))
-		atomic.StoreInt64(&ae.lastSpkLagTenthsMs, int64(math.Round(res.SpkLagMs*10)))
-		atomic.StoreInt64(&ae.lastErrTenthsMs, int64(math.Round(res.AcousticErr*10)))
-		atomic.StoreInt64(&ae.lastConfidence, int64(math.Round(res.TvConf*1000)))
-	}
+	lagMs := float64(best) / 16
+	res.TvConf = math.Min(1, psr/14)
+	res.Valid = true
+	res.Status = "TV_DETECTED"
+	res.TvLagMs = lagMs
+	res.AcousticErr = lagMs - res.SpkLagMs
+	atomic.StoreInt64(&ae.lastTvLagTenthsMs, int64(math.Round(res.TvLagMs*10)))
+	atomic.StoreInt64(&ae.lastSpkLagTenthsMs, int64(math.Round(res.SpkLagMs*10)))
+	atomic.StoreInt64(&ae.lastErrTenthsMs, int64(math.Round(res.AcousticErr*10)))
 	atomic.StoreInt64(&ae.lastConfidence, int64(math.Round(res.TvConf*1000)))
+
 	return res
+}
+
+func absLag(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
 }
