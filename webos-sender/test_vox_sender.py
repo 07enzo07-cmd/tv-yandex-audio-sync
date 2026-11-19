@@ -8,6 +8,7 @@ import unittest
 
 from vox_sender import (
     CHUNK_PCM_LEN,
+    FLAG_LOW_LATENCY,
     FLAG_MUTED,
     FLAG_SESSION_RESET,
     MAGIC_SACK,
@@ -147,6 +148,35 @@ class TestVoxAudioSenderV3(unittest.TestCase):
         self.assertEqual(calc_rms(b"\x00" * CHUNK_PCM_LEN), 0)
         tone = struct.pack("<h", 1200) * (CHUNK_PCM_LEN // 2)
         self.assertAlmostEqual(calc_rms(tone), 1200, delta=20)
+
+    def test_foreground_app_low_latency_and_session_reset(self):
+        dummy_pcm = b"\x01\x02" * (CHUNK_PCM_LEN // 2)
+        # Initial app: YouTube -> no session_reset yet, low_latency=False
+        self.assertTrue(self.sender.handle_foreground_app_event("youtube.leanback.v4"))
+        self.assertFalse(self.sender.low_latency_mode)
+        self.assertFalse(self.sender.pending_session_reset)
+        pkt_yt = self.sender.build_syn3_packet(1, 240, 1000, dummy_pcm)
+        self.assertEqual(pkt_yt[18] & FLAG_LOW_LATENCY, 0)
+
+        # Switch to HDMI2 (PS5) -> low_latency=True AND pending_session_reset=True
+        self.assertTrue(self.sender.handle_foreground_app_event("com.webos.app.hdmi2"))
+        self.assertTrue(self.sender.low_latency_mode)
+        self.assertTrue(self.sender.pending_session_reset)
+        pkt_hdmi = self.sender.build_syn3_packet(2, 480, 1005, dummy_pcm, session_reset=True)
+        self.assertEqual(pkt_hdmi[18] & FLAG_LOW_LATENCY, FLAG_LOW_LATENCY)
+        self.assertEqual(pkt_hdmi[18] & FLAG_SESSION_RESET, FLAG_SESSION_RESET)
+
+        # Duplicate event for same app does not re-trigger reset
+        self.sender.pending_session_reset = False
+        self.assertFalse(self.sender.handle_foreground_app_event("com.webos.app.hdmi2"))
+        self.assertFalse(self.sender.pending_session_reset)
+
+        # Switch to Spotify -> low_latency=False AND pending_session_reset=True
+        self.assertTrue(self.sender.handle_foreground_app_event("spotify-beehive"))
+        self.assertFalse(self.sender.low_latency_mode)
+        self.assertTrue(self.sender.pending_session_reset)
+        pkt_sp = self.sender.build_syn3_packet(3, 720, 1010, dummy_pcm)
+        self.assertEqual(pkt_sp[18] & FLAG_LOW_LATENCY, 0)
 
 
 if __name__ == "__main__":

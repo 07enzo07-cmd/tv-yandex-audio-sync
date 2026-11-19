@@ -77,27 +77,69 @@ type Player struct {
 	pipeFd     uintptr
 	pid        int
 	running    bool
+	hwMode     bool
+	exitedCh   chan error
 }
 
-func (p *Player) Start() error {
+// StartWithFallback launches aplay in direct hw:0,0 low-latency mode when wantHw is true.
+// If hw:0,0 is busy (e.g. Alice is speaking) or fails to open within 80 ms, it automatically
+// falls back to 'default' (dmix 1920/480) and returns actualHw=false.
+func (p *Player) StartWithFallback(wantHw bool) (actualHw bool, err error) {
+	if wantHw {
+		if err := p.startDevice(true); err == nil {
+			p.mu.Lock()
+			ch := p.exitedCh
+			p.mu.Unlock()
+			select {
+			case exitErr := <-ch:
+				fmt.Fprintf(os.Stderr, "[station-rx] hw:0,0 busy/exited early (%v) -> falling back to default (dmix 1920/480)\n", exitErr)
+				p.Stop()
+			case <-time.After(40 * time.Millisecond):
+				return true, nil
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "[station-rx] hw:0,0 start error (%v) -> falling back to default (dmix 1920/480)\n", err)
+		}
+	}
+	err = p.startDevice(false)
+	return false, err
+}
+
+func (p *Player) startDevice(hwMode bool) error {
 	p.Stop()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Route through 'default' (softvol -> dmix_spk_plug -> dmix_spk 1920/480) to preserve amixer Master and Alice!
-	// Omit -q so we can parse real ALSA underrun (XRUN) messages from stderr!
-	cmd := exec.Command("/usr/bin/aplay",
-		"-D", "default",
-		"--buffer-size=1440",
-		"--period-size=480",
-		"-R", "20000",
-		"-t", "raw",
-		"-f", "S16_LE",
-		"-r", "48000",
-		"-c", "2",
-		"-",
-	)
+	var args []string
+	if hwMode {
+		// Direct hw:0,0 low-latency profile (15 ms buffer / 5 ms period = 3x SYN3 frames, 0 XRUN) for HDMI/PS5 Game Mode
+		args = []string{
+			"-D", "hw:0,0",
+			"--buffer-size=720",
+			"--period-size=240",
+			"-R", "10000",
+			"-t", "raw",
+			"-f", "S16_LE",
+			"-r", "48000",
+			"-c", "2",
+			"-",
+		}
+	} else {
+		// Route through 'default' (softvol -> dmix_spk_plug -> dmix_spk 1920/480) to preserve amixer Master and Alice
+		args = []string{
+			"-D", "default",
+			"--buffer-size=1440",
+			"--period-size=480",
+			"-R", "20000",
+			"-t", "raw",
+			"-f", "S16_LE",
+			"-r", "48000",
+			"-c", "2",
+			"-",
+		}
+	}
+	cmd := exec.Command("/usr/bin/aplay", args...)
 	setPdeathsig(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -120,6 +162,11 @@ func (p *Player) Start() error {
 		return err
 	}
 
+	exitedCh := make(chan error, 1)
+	go func(c *exec.Cmd, ch chan error) {
+		ch <- c.Wait()
+	}(cmd, exitedCh)
+
 	// Parse aplay stderr for real ALSA XRUNs and errors
 	go func(r io.ReadCloser) {
 		defer r.Close()
@@ -130,7 +177,7 @@ func (p *Player) Start() error {
 			if strings.Contains(low, "underrun") || strings.Contains(low, "xrun") {
 				p.alsaXruns.Add(1)
 				fmt.Fprintf(os.Stderr, "[alsa-xrun] %s\n", line)
-			} else if strings.Contains(low, "error") || strings.Contains(low, "failed") || strings.Contains(low, "invalid") {
+			} else if strings.Contains(low, "error") || strings.Contains(low, "failed") || strings.Contains(low, "invalid") || strings.Contains(low, "busy") {
 				fmt.Fprintf(os.Stderr, "[aplay-err] %s\n", line)
 			}
 		}
@@ -141,7 +188,15 @@ func (p *Player) Start() error {
 	p.pipeFd = fd
 	p.pid = cmd.Process.Pid
 	p.running = true
+	p.hwMode = hwMode
+	p.exitedCh = exitedCh
 	return nil
+}
+
+func (p *Player) IsHwMode() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.hwMode
 }
 
 func (p *Player) AlsaXruns() uint64 {
@@ -191,6 +246,7 @@ func (p *Player) Stop() {
 		return
 	}
 	p.running = false
+	p.hwMode = false
 	p.writeSince = time.Time{}
 	w := p.stdin
 	p.stdin = nil
@@ -199,17 +255,15 @@ func (p *Player) Stop() {
 	p.cmd = nil
 	pid := p.pid
 	p.pid = 0
+	done := p.exitedCh
+	p.exitedCh = nil
 	p.mu.Unlock()
 
 	if w != nil {
 		_ = w.Close()
 	}
 
-	if cmd != nil {
-		done := make(chan error, 1)
-		go func() {
-			done <- cmd.Wait()
-		}()
+	if cmd != nil && done != nil {
 		select {
 		case <-done:
 		case <-time.After(150 * time.Millisecond):
@@ -345,23 +399,25 @@ func main() {
 	acoustic := NewAcousticEstimator()
 	acoustic.StartPassiveDmaReader()
 
-	fmt.Fprintf(os.Stderr, "[station-rx] v3.0 started on UDP4 %s | closed_loop=%t tv_actuator=%t init_delay=%d ms (H_min=%.0f ms, Q_min=%.0f ms)\n",
-		addr.String(), closedLoop, tvActEnabled, initialDelay, defaultAlsaBaseMs, defaultMinQMs)
+	fmt.Fprintf(os.Stderr, "[station-rx] v3.2 started on UDP4 %s | closed_loop=%t tv_actuator=%t init_delay=%d ms (dmix H_min=%.0f/Q_min=%.0f ms, hw:0,0 H_min=%.0f/Q_min=%.0f ms)\n",
+		addr.String(), closedLoop, tvActEnabled, initialDelay, defaultAlsaBaseMs, defaultMinQMs, hwAlsaBaseMs, hwMinQMs)
 
 	var (
-		rxPkts         uint64
-		droppedPkts    uint64
-		appStarvation  uint64
-		plcFrames      uint64
-		silenceRelease uint64
-		resyncEvents   uint64
-		queuedBytes    int64
-		lastPacketNano int64
-		atomicIsMuted  int64
-		atomicTvVol    int64 = 5
-		playbackEpoch  uint64
-		acquireActive  int32 // 1 while in ACQUIRE/probe (playback paused silently)
-		muteFadeReq    int32 // 1 to trigger immediate 20 ms fade-out & stop
+		rxPkts              uint64
+		droppedPkts         uint64
+		appStarvation       uint64
+		plcFrames           uint64
+		silenceRelease      uint64
+		resyncEvents        uint64
+		queuedBytes         int64
+		lastPacketNano      int64
+		atomicIsMuted       int64
+		atomicTvVol         int64 = 5
+		atomicStationVolPct int64 = 33
+		playbackEpoch       uint64
+		acquireActive       int32 // 1 while in ACQUIRE/probe (playback paused silently)
+		muteFadeReq         int32 // 1 to trigger immediate 20 ms fade-out & stop
+		atomicLowLatFlag    int32 // 1 when SYN3 FLAG_LOW_LATENCY is set
 	)
 
 	queue := make(chan queuedFrame, 400)
@@ -485,12 +541,16 @@ func main() {
 				atomic.StoreInt32(&acquireActive, 1)
 				player.Stop()
 				drainQueue()
-				acoustic.ResetAccumulator()
 				ctrl.EnterAcquire(reason)
 				sendTelemetry(0)
 				fmt.Fprintf(os.Stderr, "[acquire] Started silent capture (%s)\n", reason)
 
-				deadline := time.Now().Add(2000 * time.Millisecond)
+				// On app/input switch, allow webOS ~850 ms to transition audio pipeline before resetting accumulator
+				if reason == "session_reset" || reason == "low_lat_switch" {
+					time.Sleep(850 * time.Millisecond)
+				}
+				acoustic.ResetAccumulator()
+				deadline := time.Now().Add(2200 * time.Millisecond)
 				// Wait minimum 450 ms to accumulate clean audio before first FFT
 				time.Sleep(450 * time.Millisecond)
 				joined := false
@@ -506,7 +566,9 @@ func main() {
 					fmt.Fprintf(os.Stderr, "[acquire-check] ltv=%.2f psr=%.2f contrast=%.2f rms_ref=%.4f rms_mic=%.5f status=%s\n",
 						res.TvLagMs, res.TvPsr, res.Contrast, res.RefRms, res.MicRms, res.Status)
 					if ok, newDst, _, cmdSeq := ctrl.HandleAcquireResult(res, time.Now()); ok {
-						saveCalibratedDelay(newDst)
+						if !ctrl.IsLowLatencyHwMode() {
+							saveCalibratedDelay(newDst)
+						}
 						sendTelemetry(cmdSeq)
 						joined = true
 						break
@@ -515,12 +577,14 @@ func main() {
 				}
 				if !joined && atomic.LoadInt64(&atomicIsMuted) == 0 {
 					newDst, _, cmdSeq := ctrl.HandleAcquireTimeout(time.Now())
-					saveCalibratedDelay(newDst)
+					if !ctrl.IsLowLatencyHwMode() {
+						saveCalibratedDelay(newDst)
+					}
 					sendTelemetry(cmdSeq)
 				}
 				drainQueue()
 				atomic.StoreInt32(&acquireActive, 0)
-				fmt.Fprintf(os.Stderr, "[acquire] Complete -> JOIN (dst=%d ms, state=%s)\n", ctrl.TargetDelayMs(), ctrl.State())
+				fmt.Fprintf(os.Stderr, "[acquire] Complete -> JOIN (dst=%d ms, hw=%t, state=%s)\n", ctrl.TargetDelayMs(), ctrl.IsLowLatencyHwMode(), ctrl.State())
 
 			case <-ticker.C:
 				// Check manual diagnostic probe trigger: /data/audiosync/cmd_probe
@@ -566,10 +630,12 @@ func main() {
 				}
 				reacq, newDst, _, cmdSeq := ctrl.HandleTrackResult(res, time.Now())
 				if res.Valid || res.SpkConf >= 0.55 {
-					fmt.Fprintf(os.Stderr, "[track] epoch=%d spk=%.1f tv=%.1f err=%.1f psr=%.1f contrast=%.2f status=%s dst=%d\n",
-						atomic.LoadUint64(&playbackEpoch), res.SpkLagMs, res.TvLagMs, res.AcousticErr, res.TvPsr, res.Contrast, res.Status, newDst)
+					fmt.Fprintf(os.Stderr, "[track] epoch=%d hw=%t spk=%.1f tv=%.1f err=%.1f psr=%.1f contrast=%.2f status=%s dst=%d\n",
+						atomic.LoadUint64(&playbackEpoch), ctrl.IsLowLatencyHwMode(), res.SpkLagMs, res.TvLagMs, res.AcousticErr, res.TvPsr, res.Contrast, res.Status, newDst)
 				}
-				saveCalibratedDelay(newDst)
+				if !ctrl.IsLowLatencyHwMode() {
+					saveCalibratedDelay(newDst)
+				}
 				sendTelemetry(cmdSeq)
 				if reacq {
 					triggerAcquire("track_large_shift")
@@ -636,8 +702,13 @@ func main() {
 			wasIdle := prevNano == 0 || (nowNano-prevNano) > int64(1500*time.Millisecond)
 			atomic.AddUint64(&rxPkts, 1)
 
-			// Update volume via serialized worker
+			// Update volume via serialized worker (and atomic pct for hw:0,0 software volume)
 			atomic.StoreInt64(&atomicTvVol, int64(pkt.TvVol))
+			volPct := pkt.StationVolPct
+			if pkt.IsMuted {
+				volPct = 0
+			}
+			atomic.StoreInt64(&atomicStationVolPct, int64(volPct))
 			volWorker.Set(pkt.TvVol, pkt.StationVolPct, pkt.IsMuted)
 
 			// Instant Mute handling (do not wait for 1.5s standby timeout!)
@@ -653,18 +724,31 @@ func main() {
 				}
 			}
 
+			lowLatVal := int32(0)
+			if pkt.LowLatency {
+				lowLatVal = 1
+			}
+			prevLowLat := atomic.SwapInt32(&atomicLowLatFlag, lowLatVal)
+			lowLatChanged := !wasIdle && (prevLowLat != lowLatVal)
+
 			if wasIdle {
 				reorder.Reset()
+				ctrl.SetLowLatencyHwMode(pkt.LowLatency)
 				atomic.AddUint64(&playbackEpoch, 1)
 				triggerAcquire("stream_start")
 			}
 
 			ready, majorReset := reorder.Push(pkt)
-			if majorReset && !wasIdle {
+			if (majorReset || lowLatChanged) && !wasIdle {
 				atomic.AddUint64(&resyncEvents, 1)
 				atomic.AddUint64(&playbackEpoch, 1)
+				ctrl.SetLowLatencyHwMode(pkt.LowLatency)
 				drainQueue()
-				triggerAcquire("major_seek")
+				reason := "session_reset"
+				if lowLatChanged && !majorReset {
+					reason = "low_lat_switch"
+				}
+				triggerAcquire(reason)
 			}
 
 			for _, rp := range ready {
@@ -696,8 +780,8 @@ func main() {
 			if snap.TotalChecks > 0 {
 				validRate = float64(snap.ValidCount) / float64(snap.TotalChecks)
 			}
-			fmt.Fprintf(os.Stderr, "[tel] state=%s cl=%t ltv=%.1f lst=%.1f err=%+.1f conf=%.2f age_ms=%d vrate=%.2f dst=%d dtv=%d q_ms=%.1f drift=%.0fppm | rx=%d drop=%d xrun=%d starv=%d plc=%d loss=%d reord=%d rel=%d reason=%s\n",
-				snap.State, snap.ClosedLoop, snap.LtvMs, snap.LstMs, snap.ErrMs, snap.Conf, snap.LastValidAgeMs,
+			fmt.Fprintf(os.Stderr, "[tel] state=%s cl=%t hw=%t ltv=%.1f lst=%.1f err=%+.1f conf=%.2f age_ms=%d vrate=%.2f dst=%d dtv=%d q_ms=%.1f drift=%.0fppm | rx=%d drop=%d xrun=%d starv=%d plc=%d loss=%d reord=%d rel=%d reason=%s\n",
+				snap.State, snap.ClosedLoop, snap.HwMode, snap.LtvMs, snap.LstMs, snap.ErrMs, snap.Conf, snap.LastValidAgeMs,
 				validRate, snap.DstMs, snap.DtvMs, snap.QMs, snap.DriftPpm,
 				rx, atomic.LoadUint64(&droppedPkts), player.AlsaXruns(), atomic.LoadUint64(&appStarvation),
 				atomic.LoadUint64(&plcFrames), reorder.LossCount, reorder.ReorderCnt, atomic.LoadUint64(&silenceRelease),
@@ -707,7 +791,10 @@ func main() {
 
 	// 6. Main Playback Loop with Seamless Fade-In JOIN, Instant Mute Fade-Out, and Separated PLL / Delay Slew
 	silence10ms := make([]byte, 1920) // 10 ms stereo S16_LE (matches dmix 480-frame period -> 0 tail XRUNs)
+	silence5ms := make([]byte, 960)   // 5 ms stereo S16_LE (for hw:0,0 480/120 low-latency mode)
 	retimeBuf := make([]byte, 4096)
+	softVolBuf := make([]byte, 4096)
+	var softVol SoftVolume
 
 	for {
 		// Wait while idle, muted, or in silent ACQUIRE
@@ -719,16 +806,18 @@ func main() {
 			continue
 		}
 
+		minPrimeMs := ctrl.MinQueueMs()
 		targetQMs := ctrl.TargetQueueMs()
-		primeBytes := int64(math.Max(15.0, targetQMs) * 192.0) // 192 bytes/ms @ 48kHz stereo S16_LE
+		primeBytes := int64(math.Max(minPrimeMs, targetQMs) * 192.0) // 192 bytes/ms @ 48kHz stereo S16_LE
 
 		for atomic.LoadInt64(&queuedBytes) < primeBytes {
 			if atomic.LoadInt32(&acquireActive) != 0 || atomic.LoadInt64(&atomicIsMuted) != 0 {
 				break
 			}
 			time.Sleep(3 * time.Millisecond)
+			minPrimeMs = ctrl.MinQueueMs()
 			targetQMs = ctrl.TargetQueueMs()
-			primeBytes = int64(math.Max(15.0, targetQMs) * 192.0)
+			primeBytes = int64(math.Max(minPrimeMs, targetQMs) * 192.0)
 		}
 		if atomic.LoadInt32(&acquireActive) != 0 || atomic.LoadInt64(&atomicIsMuted) != 0 {
 			continue
@@ -752,19 +841,42 @@ func main() {
 			continue
 		}
 
-		if err := player.Start(); err != nil {
+		wantHw := ctrl.IsLowLatencyHwMode()
+		actualHw, err := player.StartWithFallback(wantHw)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "[station-rx] aplay start failed: %v\n", err)
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
+		if actualHw != wantHw {
+			ctrl.SetLowLatencyHwMode(actualHw)
+		}
+		// Trim any frames that arrived during the 40 ms hw:0,0 startup check so we JOIN right at targetQ
+		joinPrimeBytes := int64(math.Max(ctrl.MinQueueMs(), ctrl.TargetQueueMs()) * 192.0)
+		for atomic.LoadInt64(&queuedBytes) > joinPrimeBytes+960 {
+			select {
+			case old := <-queue:
+				atomic.AddInt64(&queuedBytes, -int64(len(old.pcm)))
+			default:
+				goto joinReady
+			}
+		}
+	joinReady:
+		softVol.Reset(int(atomic.LoadInt64(&atomicStationVolPct)))
 		ctrl.MarkJoined()
-		fmt.Fprintf(os.Stderr, "[station-rx] aplay started (pid %d) state=%s dst=%d ms targetQ=%.1f ms\n",
-			player.pid, ctrl.State(), ctrl.TargetDelayMs(), ctrl.TargetQueueMs())
+		fmt.Fprintf(os.Stderr, "[station-rx] aplay started (pid %d, hw=%t) state=%s dst=%d ms targetQ=%.1f ms\n",
+			player.pid, actualHw, ctrl.State(), ctrl.TargetDelayMs(), ctrl.TargetQueueMs())
 
 		emaQMs := ctrl.TargetQueueMs()
 		lastPiTime := time.Now()
 		fadeInMsLeft := 40.0 // 40 ms linear fade-in on JOIN
-		timer := time.NewTimer(25 * time.Millisecond)
+		starvTimeout := 25 * time.Millisecond
+		starvSilence := silence10ms
+		if actualHw {
+			starvTimeout = 20 * time.Millisecond
+			starvSilence = silence5ms
+		}
+		timer := time.NewTimer(starvTimeout)
 
 		for player.IsRunning() {
 			if atomic.LoadInt32(&acquireActive) != 0 {
@@ -776,7 +888,11 @@ func main() {
 				select {
 				case f := <-queue:
 					atomic.AddInt64(&queuedBytes, -int64(len(f.pcm)))
-					_ = player.Write(applyFade(f.pcm, 1.0, 0.0))
+					out := applyFade(f.pcm, 1.0, 0.0)
+					if player.IsHwMode() {
+						out = softVol.ScalePCM(out, softVolBuf, int(atomic.LoadInt64(&atomicStationVolPct)))
+					}
+					_ = player.Write(out)
 				default:
 				}
 				player.Stop()
@@ -791,7 +907,7 @@ func main() {
 				default:
 				}
 			}
-			timer.Reset(25 * time.Millisecond)
+			timer.Reset(starvTimeout)
 
 			select {
 			case f := <-queue:
@@ -838,6 +954,11 @@ func main() {
 					out = applyFade(out, startG, endG)
 				}
 
+				// In direct hw:0,0 mode, ALSA softvol is bypassed -> apply smooth dB software volume
+				if player.IsHwMode() {
+					out = softVol.ScalePCM(out, softVolBuf, int(atomic.LoadInt64(&atomicStationVolPct)))
+				}
+
 				if err := player.Write(out); err != nil {
 					fmt.Fprintf(os.Stderr, "[station-rx] aplay write failed: %v\n", err)
 					player.Stop()
@@ -845,7 +966,7 @@ func main() {
 				}
 
 			case <-timer.C:
-				if err := player.Write(silence10ms); err != nil {
+				if err := player.Write(starvSilence); err != nil {
 					player.Stop()
 					break
 				}

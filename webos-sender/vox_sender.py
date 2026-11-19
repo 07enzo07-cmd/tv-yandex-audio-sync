@@ -129,6 +129,11 @@ def calc_station_volume_pct(tv_vol, is_muted, slope=80.0 / 12.0, cap=100, gamma=
     return max(1, min(int(cap), pct))
 
 
+def is_low_latency_app(app_id):
+    """Return True for HDMI inputs (e.g. com.webos.app.hdmi2 / PS5 Game Mode)."""
+    return bool(app_id) and str(app_id).startswith("com.webos.app.hdmi")
+
+
 class TvDelayActuator:
     """Encapsulates webOS avSyncSpeaker get/set/restore with guaranteed rollback."""
 
@@ -260,6 +265,9 @@ class VoxAudioSender:
         self.tv_volume = 5
         self.station_volume_pct = self.calc_station_volume_pct(5, False)
         self.is_muted = False
+        self.foreground_app_id = ""
+        self.low_latency_mode = False
+        self.pending_session_reset = False
         self.vol_lock = threading.Lock()
 
         # Telemetry from SAK2 / SACK
@@ -288,6 +296,7 @@ class VoxAudioSender:
         self.capture_proc = None
         self.luna_vol_proc = None
         self.luna_pwr_proc = None
+        self.luna_app_proc = None
 
     def calc_station_volume_pct(self, tv_vol, is_muted):
         return calc_station_volume_pct(
@@ -298,13 +307,45 @@ class VoxAudioSender:
             gamma=self.cfg["vol_gamma"],
         )
 
+    def handle_foreground_app_event(self, app_id):
+        """Track foreground app/input switches, update FLAG_LOW_LATENCY, and arm session_reset."""
+        if not app_id:
+            return False
+        app_id = str(app_id).strip()
+        if not app_id:
+            return False
+        changed = False
+        prev_app = ""
+        low_lat = is_low_latency_app(app_id)
+        with self.vol_lock:
+            if app_id != self.foreground_app_id:
+                prev_app = self.foreground_app_id
+                self.foreground_app_id = app_id
+                self.low_latency_mode = low_lat
+                if prev_app:
+                    self.pending_session_reset = True
+                changed = True
+        if changed:
+            if prev_app:
+                print(
+                    f"[+] Foreground app changed: {prev_app} -> {app_id} (low_latency={low_lat}) -> session_reset",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[*] Initial foreground app: {app_id} (low_latency={low_lat})",
+                    flush=True,
+                )
+        return changed
+
     def build_syn3_packet(self, seq, sample_index, capture_ts_ms, pcm_chunk,
-                          force_muted=None, session_reset=False, low_latency=False):
+                          force_muted=None, session_reset=False, low_latency=None):
         """Pack 20-byte SYN3 header + 960-byte PCM (980 B total, zero IPv4 fragmentation)."""
         with self.vol_lock:
             tv_vol = max(0, min(100, int(self.tv_volume)))
             st_pct = max(0, min(100, int(self.station_volume_pct)))
             muted = self.is_muted if force_muted is None else bool(force_muted)
+            low_lat = self.low_latency_mode if low_latency is None else bool(low_latency)
 
         if muted or tv_vol <= 0:
             st_pct = 0
@@ -315,7 +356,7 @@ class VoxAudioSender:
             flags |= FLAG_MUTED
         if session_reset:
             flags |= FLAG_SESSION_RESET
-        if low_latency:
+        if low_lat:
             flags |= FLAG_LOW_LATENCY
 
         frame_ms_x2 = max(1, min(255, int(round((len(pcm_chunk) / (48.0 * 4.0)) * 2.0))))
@@ -465,6 +506,38 @@ class VoxAudioSender:
 
         threading.Thread(target=listener, daemon=True).start()
 
+    def _start_foreground_app_listener(self):
+        def listener():
+            cmd = [
+                "/usr/bin/luna-send", "-i",
+                "luna://com.webos.applicationManager/getForegroundAppInfo",
+                '{"subscribe":true}',
+            ]
+            while self.running:
+                try:
+                    self.luna_app_proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1
+                    )
+                    for line in self.luna_app_proc.stdout:
+                        if not self.running:
+                            break
+                        line = line.strip()
+                        if not line or not line.startswith("{"):
+                            continue
+                        try:
+                            data = json.loads(line)
+                            if data.get("returnValue"):
+                                app_id = data.get("appId", "")
+                                if app_id:
+                                    self.handle_foreground_app_event(app_id)
+                        except Exception:
+                            pass
+                except Exception:
+                    if self.running:
+                        time.sleep(2)
+
+        threading.Thread(target=listener, daemon=True).start()
+
     def _start_sack_listener(self):
         def listener():
             while self.running:
@@ -555,8 +628,22 @@ class VoxAudioSender:
         except Exception:
             pass
 
+        # Initial synchronous foreground app query
+        try:
+            app_res = subprocess.run(
+                ["/usr/bin/luna-send", "-n", "1", "luna://com.webos.applicationManager/getForegroundAppInfo", "{}"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=1.0
+            )
+            if app_res.stdout:
+                app_data = json.loads(app_res.stdout.strip())
+                if app_data.get("returnValue") and app_data.get("appId"):
+                    self.handle_foreground_app_event(app_data["appId"])
+        except Exception:
+            pass
+
         self._start_volume_listener()
         self._start_power_listener()
+        self._start_foreground_app_listener()
         self._start_sack_listener()
 
         seq = 0
@@ -567,7 +654,7 @@ class VoxAudioSender:
         is_transmitting = False
         need_session_reset = True
 
-        print(f"[*] VoxAudioSender v3.0 (SYN3 5ms/980B) -> {self.station_ip}:{self.station_port} on {self.device}", flush=True)
+        print(f"[*] VoxAudioSender v3.2 (SYN3 5ms/980B) -> {self.station_ip}:{self.station_port} on {self.device}", flush=True)
 
         # Disable cyclic GC in hot streaming loop (manual gc.collect() during silence pauses)
         gc.disable()
@@ -612,6 +699,10 @@ class VoxAudioSender:
                         silence_duration = now - last_audio_time
                         with self.vol_lock:
                             muted_or_zero = self.is_muted or (self.tv_volume <= 0)
+                            if self.pending_session_reset:
+                                need_session_reset = True
+                                self.pending_session_reset = False
+                            low_lat = self.low_latency_mode
 
                         should_stream = self.tv_active and (silence_duration < self.silence_timeout) and not muted_or_zero
 
@@ -624,7 +715,8 @@ class VoxAudioSender:
                             cap_ts_ms = int(now * 1000) & 0xFFFFFFFF
                             pkt = self.build_syn3_packet(
                                 seq, sample_index, cap_ts_ms, chunk,
-                                session_reset=need_session_reset
+                                session_reset=need_session_reset,
+                                low_latency=low_lat,
                             )
                             need_session_reset = False
                             try:
@@ -657,6 +749,7 @@ class VoxAudioSender:
                             tx_str = "STREAMING" if is_transmitting else "IDLE_PAUSED"
                             print(
                                 f"[{tx_str}] TX={self.packets_sent} ({pps:.1f} pps, RMS={rms}) | "
+                                f"App={self.foreground_app_id or '-'} LowLat={int(self.low_latency_mode)} "
                                 f"TV={self.tv_volume} ST={self.station_volume_pct}% Mute={self.is_muted} | "
                                 f"SAK2: {st_name} Dst={self.live_station_delay_ms}ms Ltv={self.live_ltv_ms:.1f}ms "
                                 f"Err={self.live_acoustic_err_ms:+.1f}ms Conf={self.live_confidence:.2f} ({self.sacks_received} acks)",
@@ -685,7 +778,7 @@ class VoxAudioSender:
     def stop(self):
         self.running = False
         self.tv_actuator.restore()
-        for proc_attr in ("capture_proc", "luna_vol_proc", "luna_pwr_proc"):
+        for proc_attr in ("capture_proc", "luna_vol_proc", "luna_pwr_proc", "luna_app_proc"):
             proc = getattr(self, proc_attr, None)
             if proc:
                 try:

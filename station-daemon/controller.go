@@ -16,17 +16,26 @@ const (
 	tvMinInterval   = 5 * time.Second
 	ltvCacheTTL     = 10 * time.Minute
 
-	// Measured hardware + low-latency dmix (960/240 = 20ms buf, 5ms period) + aplay (720/240 = 15ms buf) + 4KB pipe:
-	// H_min ≈ 25 ms (auto-calibrated live from SpkLag - q_ms), Q_min = 15 ms -> L_st_min = 40 ms
+	// Standard dmix (1920/480 = 40ms buf, 10ms period) + aplay (1440/480 = 30ms buf) + 4KB pipe:
+	// H_min ≈ 25..40 ms (auto-calibrated live from SpkLag - q_ms), Q_min = 15 ms -> L_st_min = 40 ms
 	defaultAlsaBaseMs   = 25.0
 	defaultMinQMs       = 15.0
 	defaultMinStationMs = 40
-	maxStationMs        = 950
+
+	// Direct hw:0,0 low-latency mode (720/240 = 15ms buf, 5ms period = exact SYN3 frame) + 4KB pipe:
+	// H_min ≈ 13 ms (auto-calibrated live from SpkLag - q_ms), Q_min = 8 ms -> L_st_min = 21 ms (covers PS5 ~21.5 ms with 0 XRUN!)
+	hwAlsaBaseMs       = 13.0
+	hwMinQMs           = 8.0
+	hwMinStationMs     = 21
+	hwAutoTriggerLtvMs = 45.0
+
+	maxStationMs = 950
 )
 
 type TelemetrySnapshot struct {
 	State          SyncState
 	ClosedLoop     bool
+	HwMode         bool
 	CacheUsed      bool
 	LtvMs          float64
 	LstMs          float64
@@ -49,6 +58,7 @@ type SyncController struct {
 	state             SyncState
 	closedLoop        bool
 	tvActuatorEnabled bool
+	lowLatencyHwMode  bool
 
 	alsaBaseMs   float64
 	minQMs       float64
@@ -131,6 +141,46 @@ func (c *SyncController) SetStationDelayManual(delayMs int) {
 	c.reason = "manual_step"
 }
 
+func (c *SyncController) SetLowLatencyHwMode(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.setLowLatencyHwModeLocked(enabled)
+}
+
+func (c *SyncController) setLowLatencyHwModeLocked(enabled bool) {
+	if c.lowLatencyHwMode == enabled {
+		return
+	}
+	c.lowLatencyHwMode = enabled
+	if enabled {
+		c.alsaBaseMs = hwAlsaBaseMs
+		c.minQMs = hwMinQMs
+		c.minStationMs = hwMinStationMs
+	} else {
+		c.alsaBaseMs = defaultAlsaBaseMs
+		c.minQMs = defaultMinQMs
+		c.minStationMs = defaultMinStationMs
+	}
+	if c.dstMs < c.minStationMs {
+		c.dstMs = c.minStationMs
+	}
+	if c.hasLtv {
+		c.allocateActuatorsLocked(time.Now())
+	}
+}
+
+func (c *SyncController) IsLowLatencyHwMode() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lowLatencyHwMode
+}
+
+func (c *SyncController) MinQueueMs() float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.minQMs
+}
+
 func (c *SyncController) TargetDelayMs() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -151,7 +201,7 @@ func (c *SyncController) TargetQueueMs() float64 {
 // so TargetQueueMs() always achieves exact lst == dstMs with sub-millisecond accuracy.
 func (c *SyncController) UpdateMeasuredAlsaBase(spkLagMs, curQMs float64) {
 	h := spkLagMs - curQMs
-	if h < 12.0 || h > 95.0 {
+	if h < 4.0 || h > 95.0 {
 		return
 	}
 	c.mu.Lock()
@@ -202,6 +252,14 @@ func (c *SyncController) HandleAcquireResult(res AcousticResult, now time.Time) 
 	c.lastValidAt = now
 	c.lastConf = res.TvConf
 	c.cacheUsed = false
+
+	// Auto-engage direct hw:0,0 low-latency mode if measured L_tv is below dmix floor (< 45 ms)
+	if c.ltvBaseMs < hwAutoTriggerLtvMs && !c.lowLatencyHwMode {
+		c.lowLatencyHwMode = true
+		c.alsaBaseMs = hwAlsaBaseMs
+		c.minQMs = hwMinQMs
+		c.minStationMs = hwMinStationMs
+	}
 
 	c.allocateActuatorsLocked(now)
 	c.state = StateJoin
@@ -457,6 +515,7 @@ func (c *SyncController) Snapshot(curQMs float64, now time.Time) TelemetrySnapsh
 	return TelemetrySnapshot{
 		State:          c.state,
 		ClosedLoop:     c.closedLoop,
+		HwMode:         c.lowLatencyHwMode,
 		CacheUsed:      c.cacheUsed,
 		LtvMs:          c.ltvBaseMs + float64(c.dtvMs),
 		LstMs:          c.lastLstMs,
