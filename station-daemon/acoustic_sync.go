@@ -379,15 +379,21 @@ func (ae *AcousticEstimator) extractWindow(winSamples int) (refSlice, spkSlice [
 		return nil, nil, micSlices, 0, 0, false
 	}
 
-	offsetSamples := int64(math.Round(refOffsetEma))
-	endRefPos := uint64(int64(endMicPos) + offsetSamples)
-	if endRefPos > refWritePos {
-		endRefPos = refWritePos
+	endRef := int64(endMicPos) + int64(math.Round(refOffsetEma))
+	if endRef > int64(refWritePos) {
+		// Move both windows together. Clipping only the network reference
+		// would change the measured lag with every receive burst.
+		back := uint64(endRef - int64(refWritePos))
+		if back > endMicPos {
+			return nil, nil, micSlices, 0, 0, false
+		}
+		endMicPos -= back
+		endRef = int64(refWritePos)
 	}
-	if endRefPos < uint64(winSamples) {
+	if endRef < int64(winSamples) || endMicPos < uint64(winSamples) {
 		return nil, nil, micSlices, 0, 0, false
 	}
-
+	endRefPos := uint64(endRef)
 	startMicPos := endMicPos - uint64(winSamples)
 	startRefPos := endRefPos - uint64(winSamples)
 
@@ -591,11 +597,29 @@ func (ae *AcousticEstimator) AnalyzeCleanTvLag(windowMs int, accumulate bool, mi
 	return res
 }
 
+// confirmCleanTV allows a strong clean observation immediately. A moderate
+// observation needs a second plausible peak at the same lag before it can
+// change playback. Both observations come from a muted-Station window.
+func confirmCleanTV(current, previous AcousticResult) (AcousticResult, bool) {
+	if current.Valid && current.TvPsr >= 8 && current.Contrast >= 1.3 {
+		return current, true
+	}
+	if current.TvPsr < 5 || current.Contrast < 1.1 || current.RefRms < 0.004 ||
+		previous.TvPsr < 5 || previous.Contrast < 1.1 || previous.RefRms < 0.004 ||
+		math.Abs(current.TvLagMs-previous.TvLagMs) > 7 {
+		return AcousticResult{}, false
+	}
+	if current.Valid {
+		return current, true
+	}
+	return previous, previous.Valid
+}
+
 // AnalyzeTrackSync runs in TRACK mode while Station is playing:
-// 1) Measures exact SpkLagMs from ref -> TODDR_B (always visible, high SNR).
-// 2) Accumulates weighted GCC-PHAT across active speech/music frames over full range [3..950 ms].
-// 3) Does NOT use destructive blind-zone cropping or coherent zero-lag near-field subtraction;
-//    instead cleanly distinguishes outside-overlap TV drift vs inside-overlap HOLD.
+//  1. Measures exact SpkLagMs from ref -> TODDR_B (always visible, high SNR).
+//  2. Accumulates weighted GCC-PHAT across active speech/music frames over full range [3..950 ms].
+//  3. Does NOT use destructive blind-zone cropping or coherent zero-lag near-field subtraction;
+//     instead cleanly distinguishes outside-overlap TV drift vs inside-overlap HOLD.
 func (ae *AcousticEstimator) AnalyzeTrackSync(windowMs int, expectedStationDelayMs float64) AcousticResult {
 	ae.dspMu.Lock()
 	defer ae.dspMu.Unlock()

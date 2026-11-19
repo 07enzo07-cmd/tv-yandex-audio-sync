@@ -82,7 +82,7 @@ type Player struct {
 }
 
 // StartWithFallback launches aplay in direct hw:0,0 low-latency mode when wantHw is true.
-// If hw:0,0 is busy (e.g. Alice is speaking) or fails to open within 80 ms, it automatically
+// If hw:0,0 is busy (e.g. Alice is speaking) or exits during startup, it automatically
 // falls back to 'default' (dmix 1920/480) and returns actualHw=false.
 func (p *Player) StartWithFallback(wantHw bool) (actualHw bool, err error) {
 	if wantHw {
@@ -113,12 +113,12 @@ func (p *Player) startDevice(hwMode bool) error {
 
 	var args []string
 	if hwMode {
-		// Direct hw:0,0 low-latency profile (15 ms buffer / 5 ms period = 3x SYN3 frames, 0 XRUN) for HDMI/PS5 Game Mode
+		// One ALSA period per SYN3 frame, with extra space for scheduling jitter.
 		args = []string{
 			"-D", "hw:0,0",
-			"--buffer-size=720",
-			"--period-size=240",
-			"-R", "10000",
+			fmt.Sprintf("--buffer-size=%d", hwBufferMs*48),
+			fmt.Sprintf("--period-size=%d", hwPeriodMs*48),
+			"-R", strconv.Itoa(hwStartMs * 1000),
 			"-t", "raw",
 			"-f", "S16_LE",
 			"-r", "48000",
@@ -399,7 +399,7 @@ func main() {
 	acoustic := NewAcousticEstimator()
 	acoustic.StartPassiveDmaReader()
 
-	fmt.Fprintf(os.Stderr, "[station-rx] v3.2 started on UDP4 %s | closed_loop=%t tv_actuator=%t init_delay=%d ms (dmix H_min=%.0f/Q_min=%.0f ms, hw:0,0 H_min=%.0f/Q_min=%.0f ms)\n",
+	fmt.Fprintf(os.Stderr, "[station-rx] v3.2 acoustic tracking fix started on UDP4 %s | closed_loop=%t tv_actuator=%t init_delay=%d ms (dmix H_min=%.0f/Q_min=%.0f ms, hw:0,0 H_min=%.0f/Q_min=%.0f ms)\n",
 		addr.String(), closedLoop, tvActEnabled, initialDelay, defaultAlsaBaseMs, defaultMinQMs, hwAlsaBaseMs, hwMinQMs)
 
 	var (
@@ -417,13 +417,19 @@ func main() {
 		playbackEpoch       uint64
 		acquireActive       int32 // 1 while in ACQUIRE/probe (playback paused silently)
 		muteFadeReq         int32 // 1 to trigger immediate 20 ms fade-out & stop
+		maxPacketGapNs      atomic.Int64
+		trackQueueBits      atomic.Uint64
 		atomicLowLatFlag    int32 // 1 when SYN3 FLAG_LOW_LATENCY is set
 	)
 
 	queue := make(chan queuedFrame, 400)
 	enqueue := func(f queuedFrame) {
-		// Drop oldest if queue exceeds target + 180 ms
-		maxBytes := int64((ctrl.TargetQueueMs() + 180.0) * 192.0)
+		// Bound lateness if playback cannot keep up with the receiver.
+		headroomMs := 180.0
+		if ctrl.IsLowLatencyHwMode() {
+			headroomMs = 35
+		}
+		maxBytes := int64((ctrl.TargetQueueMs() + headroomMs) * 192.0)
 		for atomic.LoadInt64(&queuedBytes) > maxBytes {
 			select {
 			case old := <-queue:
@@ -532,6 +538,9 @@ func main() {
 	// 2. ACQUIRE + TRACK Acoustic Controller Goroutine (also handles cmd_probe & cmd_step)
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
+		var lastRetryEpoch uint64
+		var energeticWindows int
+		var lastAcquireEnd time.Time
 		for {
 			select {
 			case reason := <-acquireTrigger:
@@ -550,7 +559,17 @@ func main() {
 					time.Sleep(850 * time.Millisecond)
 				}
 				acoustic.ResetAccumulator()
-				deadline := time.Now().Add(2200 * time.Millisecond)
+				probeWindowMs := 800
+				probeDuration := 2200 * time.Millisecond
+				hwProbe := ctrl.IsLowLatencyHwMode()
+				if hwProbe {
+					// Short windows limit decorrelation between the VOX capture
+					// clock and the Station microphone clock.
+					probeWindowMs = 420
+					probeDuration = 3000 * time.Millisecond
+				}
+				deadline := time.Now().Add(probeDuration)
+				var previousTv AcousticResult
 				// Wait minimum 450 ms to accumulate clean audio before first FFT
 				time.Sleep(450 * time.Millisecond)
 				joined := false
@@ -562,9 +581,20 @@ func main() {
 					if last > 0 && (time.Now().UnixNano()-last) > int64(1200*time.Millisecond) {
 						break
 					}
-					res := acoustic.AnalyzeCleanTvLag(800, true, 6.0, 1.15)
+					res := acoustic.AnalyzeCleanTvLag(probeWindowMs, !hwProbe, 6.0, 1.15)
 					fmt.Fprintf(os.Stderr, "[acquire-check] ltv=%.2f psr=%.2f contrast=%.2f rms_ref=%.4f rms_mic=%.5f status=%s\n",
 						res.TvLagMs, res.TvPsr, res.Contrast, res.RefRms, res.MicRms, res.Status)
+					if hwProbe {
+						candidate, ready := confirmCleanTV(res, previousTv)
+						if res.TvPsr >= 5 && res.Contrast >= 1.1 && res.RefRms >= 0.004 {
+							previousTv = res
+						}
+						if !ready {
+							time.Sleep(300 * time.Millisecond)
+							continue
+						}
+						res = candidate
+					}
 					if ok, newDst, _, cmdSeq := ctrl.HandleAcquireResult(res, time.Now()); ok {
 						if !ctrl.IsLowLatencyHwMode() {
 							saveCalibratedDelay(newDst)
@@ -584,6 +614,8 @@ func main() {
 				}
 				drainQueue()
 				atomic.StoreInt32(&acquireActive, 0)
+				lastAcquireEnd = time.Now()
+				energeticWindows = 0
 				fmt.Fprintf(os.Stderr, "[acquire] Complete -> JOIN (dst=%d ms, hw=%t, state=%s)\n", ctrl.TargetDelayMs(), ctrl.IsLowLatencyHwMode(), ctrl.State())
 
 			case <-ticker.C:
@@ -623,8 +655,39 @@ func main() {
 					continue
 				}
 
-				res := acoustic.AnalyzeTrackSync(1000, float64(ctrl.TargetDelayMs()))
-				if res.SpkConf >= 0.65 && res.SpkLagMs > 10.0 {
+				epoch := atomic.LoadUint64(&playbackEpoch)
+				queueMs := math.Float64frombits(trackQueueBits.Load())
+				trackWindowMs := 1000
+				targetMs := ctrl.TargetDelayMs()
+				if ctrl.IsLowLatencyHwMode() && targetMs < 200 {
+					trackWindowMs = 480
+				}
+				res := acoustic.AnalyzeTrackSync(trackWindowMs, float64(targetMs))
+				if epoch != atomic.LoadUint64(&playbackEpoch) || !player.IsRunning() {
+					continue
+				}
+				now := time.Now()
+				if ctrl.IsLowLatencyHwMode() {
+					h, changed := ctrl.CalibrateHardwareDelay(res, queueMs, now)
+					if changed {
+						fmt.Fprintf(os.Stderr, "[acoustic-sync] loopback calibration H=%.1f ms targetQ=%.1f ms\n",
+							h, ctrl.TargetQueueMs())
+					}
+					// If startup was too quiet for a clean TV measurement, retry once
+					// after there is sustained programme audio in this playback epoch.
+					snap := ctrl.Snapshot(queueMs, now)
+					if snap.ClosedLoop && snap.LastValidAgeMs < 0 && epoch != lastRetryEpoch && now.Sub(lastAcquireEnd) > 8*time.Second {
+						if res.RefRms >= 0.008 && res.MicRms >= 0.00002 {
+							energeticWindows++
+						} else {
+							energeticWindows = 0
+						}
+						if energeticWindows >= 3 {
+							lastRetryEpoch = epoch
+							triggerAcquire("hdmi_signal_returned")
+						}
+					}
+				} else if res.SpkConf >= 0.65 && res.SpkLagMs > 10.0 {
 					curQMs := float64(atomic.LoadInt64(&queuedBytes)+int64(player.PipeQueuedBytes())) / 192.0
 					ctrl.UpdateMeasuredAlsaBase(res.SpkLagMs, curQMs)
 				}
@@ -699,7 +762,11 @@ func main() {
 
 			nowNano := time.Now().UnixNano()
 			prevNano := atomic.SwapInt64(&lastPacketNano, nowNano)
-			wasIdle := prevNano == 0 || (nowNano-prevNano) > int64(1500*time.Millisecond)
+			gap := nowNano - prevNano
+			wasIdle := prevNano == 0 || gap > int64(1500*time.Millisecond)
+			if !wasIdle && gap > maxPacketGapNs.Load() {
+				maxPacketGapNs.Store(gap)
+			}
 			atomic.AddUint64(&rxPkts, 1)
 
 			// Update volume via serialized worker (and atomic pct for hw:0,0 software volume)
@@ -780,9 +847,9 @@ func main() {
 			if snap.TotalChecks > 0 {
 				validRate = float64(snap.ValidCount) / float64(snap.TotalChecks)
 			}
-			fmt.Fprintf(os.Stderr, "[tel] state=%s cl=%t hw=%t ltv=%.1f lst=%.1f err=%+.1f conf=%.2f age_ms=%d vrate=%.2f dst=%d dtv=%d q_ms=%.1f drift=%.0fppm | rx=%d drop=%d xrun=%d starv=%d plc=%d loss=%d reord=%d rel=%d reason=%s\n",
+			fmt.Fprintf(os.Stderr, "[tel] state=%s cl=%t hw=%t ltv=%.1f lst=%.1f err=%+.1f conf=%.2f age_ms=%d vrate=%.2f dst=%d dtv=%d q_ms=%.1f drift=%.0fppm max_rx_gap_ms=%.1f | rx=%d drop=%d xrun=%d starv=%d plc=%d loss=%d reord=%d rel=%d reason=%s\n",
 				snap.State, snap.ClosedLoop, snap.HwMode, snap.LtvMs, snap.LstMs, snap.ErrMs, snap.Conf, snap.LastValidAgeMs,
-				validRate, snap.DstMs, snap.DtvMs, snap.QMs, snap.DriftPpm,
+				validRate, snap.DstMs, snap.DtvMs, snap.QMs, snap.DriftPpm, float64(maxPacketGapNs.Swap(0))/float64(time.Millisecond),
 				rx, atomic.LoadUint64(&droppedPkts), player.AlsaXruns(), atomic.LoadUint64(&appStarvation),
 				atomic.LoadUint64(&plcFrames), reorder.LossCount, reorder.ReorderCnt, atomic.LoadUint64(&silenceRelease),
 				snap.Reason)
@@ -791,7 +858,6 @@ func main() {
 
 	// 6. Main Playback Loop with Seamless Fade-In JOIN, Instant Mute Fade-Out, and Separated PLL / Delay Slew
 	silence10ms := make([]byte, 1920) // 10 ms stereo S16_LE (matches dmix 480-frame period -> 0 tail XRUNs)
-	silence5ms := make([]byte, 960)   // 5 ms stereo S16_LE (for hw:0,0 480/120 low-latency mode)
 	retimeBuf := make([]byte, 4096)
 	softVolBuf := make([]byte, 4096)
 	var softVol SoftVolume
@@ -848,6 +914,10 @@ func main() {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
+		if atomic.LoadInt32(&acquireActive) != 0 || !player.IsRunning() {
+			player.Stop()
+			continue
+		}
 		if actualHw != wantHw {
 			ctrl.SetLowLatencyHwMode(actualHw)
 		}
@@ -864,19 +934,20 @@ func main() {
 	joinReady:
 		softVol.Reset(int(atomic.LoadInt64(&atomicStationVolPct)))
 		ctrl.MarkJoined()
-		fmt.Fprintf(os.Stderr, "[station-rx] aplay started (pid %d, hw=%t) state=%s dst=%d ms targetQ=%.1f ms\n",
-			player.pid, actualHw, ctrl.State(), ctrl.TargetDelayMs(), ctrl.TargetQueueMs())
+		fmt.Fprintf(os.Stderr, "[station-rx] aplay started (hw=%t) state=%s dst=%d ms targetQ=%.1f ms\n",
+			actualHw, ctrl.State(), ctrl.TargetDelayMs(), ctrl.TargetQueueMs())
 
 		emaQMs := ctrl.TargetQueueMs()
+		windowQueueMs := emaQMs
+		trackQueueBits.Store(math.Float64bits(windowQueueMs))
 		lastPiTime := time.Now()
 		fadeInMsLeft := 40.0 // 40 ms linear fade-in on JOIN
-		starvTimeout := 25 * time.Millisecond
-		starvSilence := silence10ms
+		wait := 25 * time.Millisecond
 		if actualHw {
-			starvTimeout = 20 * time.Millisecond
-			starvSilence = silence5ms
+			wait = 10 * time.Millisecond
 		}
-		timer := time.NewTimer(starvTimeout)
+		timer := time.NewTimer(wait)
+		var frameRemainder float64
 
 		for player.IsRunning() {
 			if atomic.LoadInt32(&acquireActive) != 0 {
@@ -907,7 +978,7 @@ func main() {
 				default:
 				}
 			}
-			timer.Reset(starvTimeout)
+			timer.Reset(wait)
 
 			select {
 			case f := <-queue:
@@ -918,22 +989,32 @@ func main() {
 
 				errQMs := emaQMs - targetQMs
 				now := time.Now()
-				driftPpm := ctrl.UpdateClockDriftPI(errQMs, now.Sub(lastPiTime).Seconds())
+				dt := now.Sub(lastPiTime).Seconds()
+				driftPpm := ctrl.UpdateClockDriftPI(errQMs, dt)
+				if actualHw {
+					windowQueueMs += math.Min(1, dt/0.65) * (curQMs - windowQueueMs)
+					trackQueueBits.Store(math.Float64bits(windowQueueMs))
+				}
 				lastPiTime = now
 
-				// Separated Delay Slew (up to ±1.5% rate-nudge) + Clock Drift PI (±200 ppm)
+				// Combine fast queue correction with sustained rate correction.
 				inFrames := len(f.pcm) / 4
 				outFrames := inFrames
 				if inFrames >= 48 {
 					var rateDelta float64
-					// Clock drift component (±0.0002)
+					// Sustained sender/receiver rate mismatch.
 					rateDelta -= driftPpm * 1e-6
 					// Delay slew component for |errQMs| > 3 ms (up to ±1.5%)
 					if math.Abs(errQMs) > 3.0 {
 						slew := math.Max(-0.015, math.Min(0.015, errQMs*0.0008))
 						rateDelta -= slew
 					}
-					deltaFrames := int(math.Round(float64(inFrames) * rateDelta))
+					frameDelta := float64(inFrames) * rateDelta
+					if actualHw {
+						frameDelta += frameRemainder
+					}
+					deltaFrames := int(math.Round(frameDelta))
+					frameRemainder = frameDelta - float64(deltaFrames)
 					if deltaFrames != 0 {
 						outFrames = inFrames + deltaFrames
 					}
@@ -966,11 +1047,16 @@ func main() {
 				}
 
 			case <-timer.C:
-				if err := player.Write(starvSilence); err != nil {
+				atomic.AddUint64(&appStarvation, 1)
+				// A timer cannot tell whether ALSA has already buffered enough PCM.
+				// In direct mode, extra silence would alter the stream's latency.
+				if actualHw {
+					continue
+				}
+				if err := player.Write(silence10ms); err != nil {
 					player.Stop()
 					break
 				}
-				atomic.AddUint64(&appStarvation, 1)
 			}
 		}
 

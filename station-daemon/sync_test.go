@@ -166,28 +166,27 @@ func TestControllerStateMachineAndNoOscillation(t *testing.T) {
 	ctrl := NewSyncController(115, true, true) // dual-actuator enabled for policy test
 	ctrl.EnterAcquire("start")
 
-	// 1. Acquire with L_tv = 10 ms (< hwMinStationMs 19 ms, auto-engages hwMode) -> Station to 19 ms, TV delay requested ~10 ms
+	// 1. A 10 ms TV lag requires a 20 ms TV delay at the 33 ms hardware floor.
 	ok, dst, reqDtv, seq := ctrl.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 10.0, TvConf: 0.9}, now)
-	if !ok || !ctrl.IsLowLatencyHwMode() || dst != hwMinStationMs || reqDtv != 10 || seq != 1 {
-		t.Fatalf("expected hwMode=true dst=%d reqDtv=10 seq=1, got ok=%t hw=%t dst=%d reqDtv=%d seq=%d",
+	if !ok || !ctrl.IsLowLatencyHwMode() || dst != hwMinStationMs || reqDtv != 20 || seq != 1 {
+		t.Fatalf("expected hwMode=true dst=%d reqDtv=20 seq=1, got ok=%t hw=%t dst=%d reqDtv=%d seq=%d",
 			hwMinStationMs, ok, ctrl.IsLowLatencyHwMode(), dst, reqDtv, seq)
 	}
-	ctrl.HandleTvap(TvapPacket{AppliedTvDelayMs: 10, Status: tvapStatusOK, CmdSeq: seq})
+	ctrl.HandleTvap(TvapPacket{AppliedTvDelayMs: 20, Status: tvapStatusOK, CmdSeq: seq})
 	ctrl.MarkJoined()
 	if ctrl.State() != StateTrack {
 		t.Fatalf("expected StateTrack after TVAP, got %s", ctrl.State())
 	}
 
-	// 2. Suppose L_tv rises slightly to 25 ms (margin only +7.5 ms < 10 ms hysteresis) -> MUST NOT drop D_tv to 0!
+	// 2. When the TV baseline rises to 25 ms, keep its delay within the hysteresis margin.
 	_, _, reqDtv2, _ := ctrl.HandleTrackResult(AcousticResult{
-		Valid: true, SpkConf: 0.9, SpkLagMs: 19.0, TvLagMs: 35.0, AcousticErr: 16.0, TvConf: 0.9,
+		Valid: true, SpkConf: 0.9, SpkLagMs: 30.0, TvLagMs: 45.0, AcousticErr: 15.0, TvConf: 0.9,
 	}, now.Add(6*time.Second))
-	if reqDtv2 != 10 {
-		t.Fatalf("hysteresis violated: D_tv should remain 10 ms when margin < 10 ms, got %d", reqDtv2)
+	if reqDtv2 != 20 {
+		t.Fatalf("hysteresis violated: D_tv should remain 20 ms when margin < 10 ms, got %d", reqDtv2)
 	}
 
-	// 3. Test UNREACHABLE when TV actuator disabled and L_tv = 15 ms < hwMinStationMs (19 ms)
-	// Note: ACQUIRE with L_tv < 45 ms auto-engages lowLatencyHwMode (minStationMs = 19 ms)
+	// 3. A 12 ms TV lag is below the playback floor with the TV actuator disabled.
 	ctrlNoTv := NewSyncController(115, true, false)
 	ctrlNoTv.EnterAcquire("start")
 	ctrlNoTv.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 12.0, TvConf: 0.9}, now)
@@ -244,19 +243,19 @@ func TestLowLatencyHwModeAndFallback(t *testing.T) {
 	now := time.Now()
 	ctrl := NewSyncController(65, true, false)
 
-	// 1. Auto-engage hw:0,0 when ACQUIRE measures PS5 Game Mode L_tv = 21.5 ms (< 45 ms)
+	// 1. Auto-engage hw:0,0 when ACQUIRE measures PS5 Game Mode L_tv = 30 ms (< 45 ms)
 	ctrl.EnterAcquire("hdmi2_start")
-	ok, dst, _, _ := ctrl.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 21.5, TvConf: 0.92}, now)
+	ok, dst, _, _ := ctrl.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 30.0, TvConf: 0.92}, now)
 	if !ok || !ctrl.IsLowLatencyHwMode() {
 		t.Fatalf("expected auto hwMode=true on L_tv=21.5ms, got ok=%t hw=%t", ok, ctrl.IsLowLatencyHwMode())
 	}
-	// Desired dst = round(21.5 - (-1.5)) = 23 ms (reachable in hw:0,0 since minStationMs=19!)
-	if dst != 23 {
-		t.Fatalf("expected dst=23 ms in hwMode, got %d", dst)
+	// The wanted 32 ms is below the buffered hardware mode floor.
+	if dst != hwMinStationMs {
+		t.Fatalf("expected hardware floor %d ms, got %d", hwMinStationMs, dst)
 	}
 	ctrl.MarkJoined()
 	if ctrl.State() != StateTrack {
-		t.Fatalf("expected StateTrack for PS5 21.5ms in hwMode, got %s", ctrl.State())
+		t.Fatalf("expected StateTrack within 5 ms of the floor, got %s", ctrl.State())
 	}
 
 	// 2. Live H_measured calibration works down to ~10 ms in hw:0,0 mode
@@ -280,3 +279,123 @@ func TestLowLatencyHwModeAndFallback(t *testing.T) {
 	}
 }
 
+func TestHDMIAcquireTimeoutKeepsSafeDelay(t *testing.T) {
+	ctrl := NewSyncController(65, true, false)
+	now := time.Now()
+	ctrl.EnterAcquire("stream_start")
+	ctrl.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 65}, now)
+	ctrl.SetLowLatencyHwMode(true)
+	ctrl.EnterAcquire("session_reset")
+	dst, tvDelay, _ := ctrl.HandleAcquireTimeout(now.Add(time.Second))
+	if dst != 67 || tvDelay != 0 || ctrl.Snapshot(0, now).CacheUsed {
+		t.Fatalf("expected safe target without a stale TV lock or actuator, got dst=%d tv=%d", dst, tvDelay)
+	}
+}
+
+func TestHDMIClockCorrectionHandlesCaptureRate(t *testing.T) {
+	ctrl := NewSyncController(65, true, false)
+	ctrl.SetLowLatencyHwMode(true)
+	var ppm float64
+	for i := 0; i < 12; i++ {
+		ppm = ctrl.UpdateClockDriftPI(-4, 1)
+	}
+	if ppm > -13000 || ppm < -20000 {
+		t.Fatalf("expected correction for ~197 frames/s, got %.0f ppm", ppm)
+	}
+}
+
+func TestSoftVolumePreservesFullScaleSignedPCM(t *testing.T) {
+	pcm := []byte{0xff, 0x7f, 0x00, 0x80}
+	var volume SoftVolume
+	volume.Reset(100)
+	if out := volume.ScalePCM(pcm, nil, 100); string(out) != string(pcm) {
+		t.Fatalf("expected signed PCM endpoints unchanged, got %x", out)
+	}
+}
+
+func TestHardwareDelayCalibrationUsesCleanTVTargetAndLoopbackConsensus(t *testing.T) {
+	ctrl := NewSyncController(60, true, false)
+	ctrl.SetLowLatencyHwMode(true)
+	now := time.Now()
+	ctrl.EnterAcquire("stream_start")
+	ctrl.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 52.8, TvConf: .8}, now)
+	ctrl.MarkJoined()
+	before := ctrl.TargetQueueMs()
+	for i, lag := range []float64{55, 58, 57, 33, 56, 76, 58} {
+		_, changed := ctrl.CalibrateHardwareDelay(AcousticResult{
+			SpkLagMs: lag, SpkConf: .92, InOverlap: true,
+		}, 24, now.Add(time.Duration(i)*time.Second/2))
+		if changed != (i == 6) {
+			t.Fatalf("sample %d: unexpected calibration change %t", i, changed)
+		}
+	}
+	if q := ctrl.TargetQueueMs(); q != before-3 {
+		t.Fatalf("expected to smoothly reduce queue by 3 ms, got %.1f -> %.1f", before, q)
+	}
+
+	ctrl.EnterAcquire("session_reset")
+	for i := 0; i < 10; i++ {
+		if _, changed := ctrl.CalibrateHardwareDelay(AcousticResult{SpkLagMs: 55, SpkConf: .99}, 24, now); changed {
+			t.Fatal("cannot calibrate against a prior source's TV measurement")
+		}
+	}
+}
+
+func TestHardwareDelayCalibrationRejectsDisagreement(t *testing.T) {
+	ctrl := NewSyncController(60, true, false)
+	ctrl.SetLowLatencyHwMode(true)
+	now := time.Now()
+	ctrl.EnterAcquire("stream_start")
+	ctrl.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 52.8}, now)
+	for i, lag := range []float64{32, 38, 44, 50, 56, 62, 68} {
+		if _, changed := ctrl.CalibrateHardwareDelay(AcousticResult{
+			SpkLagMs: lag, SpkConf: .98,
+		}, 24, now.Add(time.Duration(i)*time.Second/2)); changed {
+			t.Fatal("disputed estimates must leave the playback target unchanged")
+		}
+	}
+}
+
+func TestAcousticWindowsStayAlignedWhenPacketsArriveLate(t *testing.T) {
+	ae := NewAcousticEstimator()
+	ae.micWritePos = 6000
+	ae.refWritePos = 5800
+	for i := 0; i < 6000; i++ {
+		ae.refRing[i] = float32(i)
+		ae.micRing[0][i] = float32(i)
+		ae.spkLoopRing[i] = float32(i)
+	}
+	ref, spk, mic, _, _, ok := ae.extractWindow(4096)
+	if !ok || ref[0] != mic[0][0] || ref[4095] != spk[4095] {
+		t.Fatal("receive batching must not shift the mic/loopback windows against the reference")
+	}
+}
+
+func TestHardwareTrackHoldsCleanLockAgainstSingleMixedPeak(t *testing.T) {
+	ctrl := NewSyncController(60, true, false)
+	ctrl.SetLowLatencyHwMode(true)
+	now := time.Now()
+	ctrl.EnterAcquire("stream_start")
+	ctrl.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 52.8}, now)
+	ctrl.MarkJoined()
+	shift := AcousticResult{Valid: true, TvLagMs: 38, AcousticErr: -18, TvConf: .9}
+	ctrl.HandleTrackResult(shift, now.Add(time.Second))
+	if got := ctrl.Snapshot(0, now.Add(time.Second)).LtvMs; got != 52.8 {
+		t.Fatalf("single mixed-window peak must preserve prior TV lock, got %.1f", got)
+	}
+	ctrl.HandleTrackResult(shift, now.Add(2*time.Second))
+	if got := ctrl.Snapshot(0, now.Add(2*time.Second)).LtvMs; got != 38 {
+		t.Fatalf("confirmed change must update acoustic TV lag, got %.1f", got)
+	}
+}
+
+func TestConfirmCleanTVRejectsIsolatedModeratePeak(t *testing.T) {
+	moderate := AcousticResult{Valid: true, TvLagMs: 52, TvPsr: 6.2, Contrast: 1.19, RefRms: .012}
+	if _, ok := confirmCleanTV(moderate, AcousticResult{}); ok {
+		t.Fatal("one moderate peak must not set the acoustic target")
+	}
+	support := AcousticResult{TvLagMs: 46, TvPsr: 5.6, Contrast: 1.24, RefRms: .007}
+	if got, ok := confirmCleanTV(support, moderate); !ok || got.TvLagMs != 52 {
+		t.Fatalf("expected supporting peak to confirm earlier clean measurement, got %+v", got)
+	}
+}

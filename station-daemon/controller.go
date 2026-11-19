@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"sort"
 	"sync"
 	"time"
 )
@@ -22,11 +23,13 @@ const (
 	defaultMinQMs       = 15.0
 	defaultMinStationMs = 40
 
-	// Direct hw:0,0 low-latency mode (720/240 = 15ms buf, 5ms period = exact SYN3 frame) + 4KB pipe:
-	// H_min ≈ 13 ms (auto-calibrated live from SpkLag - q_ms), Q_min = 8 ms -> L_st_min = 21 ms (covers PS5 ~21.5 ms with 0 XRUN!)
-	hwAlsaBaseMs       = 13.0
+	// Direct ALSA playback retains a 5 ms period and leaves room for capture/network jitter.
+	hwPeriodMs         = 5
+	hwBufferMs         = 25
+	hwStartMs          = 15
+	hwAlsaBaseMs       = float64(hwBufferMs)
 	hwMinQMs           = 8.0
-	hwMinStationMs     = 21
+	hwMinStationMs     = int(hwAlsaBaseMs + hwMinQMs)
 	hwAutoTriggerLtvMs = 45.0
 
 	maxStationMs = 950
@@ -64,6 +67,11 @@ type SyncController struct {
 	minQMs       float64
 	minStationMs int
 
+	// Independent loopback measurements of the delay downstream of the queue.
+	hardwareDelaySamples [7]float64
+	hardwareDelayCount   int
+	hardwareDelayAt      time.Time
+
 	// Current actuator setpoints
 	dstMs       int // Station total target delay (ms)
 	dtvMs       int // Confirmed TV speaker delay (ms)
@@ -91,6 +99,10 @@ type SyncController struct {
 	// Consecutive outside-overlap drift detections in TRACK before triggering REACQUIRE
 	driftConfirmCount int
 	lastDriftErr      float64
+
+	trackPendingCount int
+	trackPendingTVMs  float64
+	trackPendingErrMs float64
 
 	// Separated Clock Drift PI state (±200 ppm)
 	driftIntegral float64
@@ -152,6 +164,10 @@ func (c *SyncController) setLowLatencyHwModeLocked(enabled bool) {
 		return
 	}
 	c.lowLatencyHwMode = enabled
+	c.trackPendingCount = 0
+	c.hardwareDelayCount = 0
+	c.driftIntegral = 0
+	c.driftPpm = 0
 	if enabled {
 		c.alsaBaseMs = hwAlsaBaseMs
 		c.minQMs = hwMinQMs
@@ -210,6 +226,48 @@ func (c *SyncController) UpdateMeasuredAlsaBase(spkLagMs, curQMs float64) {
 	c.minStationMs = int(math.Ceil(c.alsaBaseMs + c.minQMs))
 }
 
+// CalibrateHardwareDelay measures the Station path against its digital loopback.
+// Its TV target still comes from the microphones, including when the two speakers
+// are too close together for the mixed microphone recording to separate them.
+func (c *SyncController) CalibrateHardwareDelay(res AcousticResult, queueMs float64, now time.Time) (float64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.closedLoop || !c.lowLatencyHwMode || !c.hasLtv || now.Sub(c.ltvAt) > ltvCacheTTL {
+		c.hardwareDelayCount = 0
+		return 0, false
+	}
+	if now.Sub(c.hardwareDelayAt) > 2*time.Second {
+		c.hardwareDelayCount = 0
+	}
+	h := res.SpkLagMs - queueMs
+	if res.SpkConf < 0.65 || h < 6 || h > 65 {
+		return 0, false
+	}
+	c.hardwareDelayAt = now
+	c.hardwareDelaySamples[c.hardwareDelayCount] = h
+	c.hardwareDelayCount++
+	if c.hardwareDelayCount < len(c.hardwareDelaySamples) {
+		return 0, false
+	}
+	c.hardwareDelayCount = 0
+	sort.Float64s(c.hardwareDelaySamples[:])
+	median := c.hardwareDelaySamples[len(c.hardwareDelaySamples)/2]
+	agreed := 0
+	for _, sample := range c.hardwareDelaySamples {
+		if math.Abs(sample-median) <= 8 {
+			agreed++
+		}
+	}
+	if agreed < 5 || math.Abs(median-c.alsaBaseMs) <= 2 {
+		return 0, false
+	}
+	// Limit how fast a confirmed correction moves the playback queue.
+	slew := math.Max(-3, math.Min(3, median-c.alsaBaseMs))
+	c.alsaBaseMs += slew
+	c.minStationMs = int(math.Ceil(c.alsaBaseMs + c.minQMs))
+	return c.alsaBaseMs, true
+}
+
 func (c *SyncController) State() SyncState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -228,6 +286,17 @@ func (c *SyncController) EnterAcquire(reason string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.state = StateAcquire
+	c.trackPendingCount = 0
+	c.hardwareDelayCount = 0
+	if reason == "session_reset" || reason == "low_lat_switch" {
+		c.hasLtv = false
+		c.ltvBaseMs = 0
+		c.driftIntegral = 0
+		c.driftPpm = 0
+		c.lastValidAt = time.Time{}
+		c.lastConf = 0
+		c.lastErrMs = 0
+	}
 	c.driftConfirmCount = 0
 	c.cacheUsed = false
 	c.reason = reason
@@ -256,6 +325,8 @@ func (c *SyncController) HandleAcquireResult(res AcousticResult, now time.Time) 
 	// Auto-engage direct hw:0,0 low-latency mode if measured L_tv is below dmix floor (< 45 ms)
 	if c.ltvBaseMs < hwAutoTriggerLtvMs && !c.lowLatencyHwMode {
 		c.lowLatencyHwMode = true
+		c.driftIntegral = 0
+		c.driftPpm = 0
 		c.alsaBaseMs = hwAlsaBaseMs
 		c.minQMs = hwMinQMs
 		c.minStationMs = hwMinStationMs
@@ -310,6 +381,7 @@ func (c *SyncController) HandleTrackResult(res AcousticResult, now time.Time) (t
 	}
 
 	if res.InOverlap {
+		c.trackPendingCount = 0
 		c.driftConfirmCount = 0
 		if c.hasLtv && (c.ltvBaseMs+float64(c.dtvMs)) < float64(c.minStationMs)-5.0 {
 			c.state = StateUnreachable
@@ -322,8 +394,23 @@ func (c *SyncController) HandleTrackResult(res AcousticResult, now time.Time) (t
 	}
 
 	if !res.Valid {
+		c.trackPendingCount = 0
 		c.reason = "track_" + res.Status
 		return false, c.dstMs, c.reqDtvMs, c.tvCmdSeq
+	}
+	if c.lowLatencyHwMode {
+		if c.trackPendingCount > 0 && math.Abs(c.trackPendingTVMs-res.TvLagMs) <= 8 &&
+			math.Abs(c.trackPendingErrMs-res.AcousticErr) <= 8 {
+			c.trackPendingCount++
+		} else {
+			c.trackPendingCount = 1
+		}
+		c.trackPendingTVMs = res.TvLagMs
+		c.trackPendingErrMs = res.AcousticErr
+		if c.trackPendingCount < 2 {
+			c.reason = "confirming_tv_peak"
+			return false, c.dstMs, c.reqDtvMs, c.tvCmdSeq
+		}
 	}
 
 	c.validCount++
@@ -473,7 +560,7 @@ func (c *SyncController) allocateActuatorsLocked(now time.Time) {
 	}
 }
 
-// UpdateClockDriftPI updates the slow crystal drift loop (±200 ppm max) from smoothed queue error (ms).
+// UpdateClockDriftPI corrects sustained rate mismatch from the smoothed queue error.
 func (c *SyncController) UpdateClockDriftPI(qErrMs float64, dtSec float64) float64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -484,9 +571,12 @@ func (c *SyncController) UpdateClockDriftPI(qErrMs float64, dtSec float64) float
 	if math.Abs(qErrMs) < 1.5 {
 		return c.driftPpm
 	}
-	const kp = 4.0  // ppm per ms
-	const ki = 0.25 // ppm per (ms*s)
-	const maxPpm = 200.0
+	kp, ki, maxPpm := 4.0, 0.25, 200.0
+	if c.lowLatencyHwMode {
+		// HDMI capture on VOX delivers about 197 nominal 5 ms frames/s.
+		// The 200 ppm crystal correction cannot cover that rate mismatch.
+		kp, ki, maxPpm = 100.0, 350.0, 20000.0
+	}
 
 	c.driftIntegral += qErrMs * ki * dtSec
 	if c.driftIntegral > maxPpm {
