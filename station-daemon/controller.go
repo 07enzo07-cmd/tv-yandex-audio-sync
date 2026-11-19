@@ -24,13 +24,14 @@ const (
 	defaultMinStationMs = 40
 
 	// Direct ALSA playback retains a 5 ms period and leaves room for capture/network jitter.
-	hwPeriodMs         = 5
-	hwBufferMs         = 25
-	hwStartMs          = 15
-	hwAlsaBaseMs       = float64(hwBufferMs)
-	hwMinQMs           = 8.0
-	hwMinStationMs     = int(hwAlsaBaseMs + hwMinQMs)
-	hwAutoTriggerLtvMs = 45.0
+	hwPeriodMs          = 5
+	hwBufferMs          = 25
+	hwStartMs           = 15
+	hwAlsaBaseMs        = float64(hwBufferMs)
+	hwMinQMs            = 8.0
+	hwMinStationMs      = int(hwAlsaBaseMs + hwMinQMs)
+	hwAutoTriggerLtvMs  = 45.0
+	hwReacquireCooldown = 2 * time.Minute
 
 	maxStationMs = 950
 )
@@ -103,6 +104,7 @@ type SyncController struct {
 	trackPendingCount int
 	trackPendingTVMs  float64
 	trackPendingErrMs float64
+	lastHwReacquireAt time.Time
 
 	// Separated Clock Drift PI state (±200 ppm)
 	driftIntegral float64
@@ -291,6 +293,7 @@ func (c *SyncController) EnterAcquire(reason string) {
 	if reason == "session_reset" || reason == "low_lat_switch" {
 		c.hasLtv = false
 		c.ltvBaseMs = 0
+		c.lastHwReacquireAt = time.Time{}
 		c.driftIntegral = 0
 		c.driftPpm = 0
 		c.lastValidAt = time.Time{}
@@ -399,18 +402,8 @@ func (c *SyncController) HandleTrackResult(res AcousticResult, now time.Time) (t
 		return false, c.dstMs, c.reqDtvMs, c.tvCmdSeq
 	}
 	if c.lowLatencyHwMode {
-		if c.trackPendingCount > 0 && math.Abs(c.trackPendingTVMs-res.TvLagMs) <= 8 &&
-			math.Abs(c.trackPendingErrMs-res.AcousticErr) <= 8 {
-			c.trackPendingCount++
-		} else {
-			c.trackPendingCount = 1
-		}
-		c.trackPendingTVMs = res.TvLagMs
-		c.trackPendingErrMs = res.AcousticErr
-		if c.trackPendingCount < 2 {
-			c.reason = "confirming_tv_peak"
-			return false, c.dstMs, c.reqDtvMs, c.tvCmdSeq
-		}
+		reacquire := c.requestHardwareReacquireLocked(res, now)
+		return reacquire, c.dstMs, c.reqDtvMs, c.tvCmdSeq
 	}
 
 	c.validCount++
@@ -463,6 +456,41 @@ func (c *SyncController) HandleTrackResult(res AcousticResult, now time.Time) (t
 	c.driftConfirmCount = 0
 	c.allocateActuatorsLocked(now)
 	return false, c.dstMs, c.reqDtvMs, c.tvCmdSeq
+}
+
+// A mixed HDMI measurement can identify the same reflection in consecutive
+// windows. Use it to request a clean measurement before changing the TV target.
+func (c *SyncController) requestHardwareReacquireLocked(res AcousticResult, now time.Time) bool {
+	if !c.closedLoop {
+		c.trackPendingCount = 0
+		c.reason = "observe_only"
+		return false
+	}
+	if math.Abs(res.AcousticErr-targetErrMs) <= 15 ||
+		(c.hasLtv && math.Abs(res.TvLagMs-(c.ltvBaseMs+float64(c.dtvMs))) < 10) ||
+		(c.hasLtv && now.Sub(c.ltvAt) < 20*time.Second) ||
+		now.Sub(c.lastHwReacquireAt) < hwReacquireCooldown {
+		c.trackPendingCount = 0
+		c.reason = "hold_clean_tv_target"
+		return false
+	}
+
+	if c.trackPendingCount == 0 || math.Abs(c.trackPendingTVMs-res.TvLagMs) > 8 ||
+		math.Abs(c.trackPendingErrMs-res.AcousticErr) > 8 {
+		c.trackPendingCount = 0
+	}
+	c.trackPendingCount++
+	c.trackPendingTVMs = res.TvLagMs
+	c.trackPendingErrMs = res.AcousticErr
+	if c.trackPendingCount < 3 {
+		c.reason = "confirming_tv_peak"
+		return false
+	}
+	c.trackPendingCount = 0
+	c.lastHwReacquireAt = now
+	c.state = StateReacquire
+	c.reason = "verify_tv_with_clean_audio"
+	return true
 }
 
 // HandleTvap updates confirmed TV speaker delay from TV's TVAP ack.

@@ -371,21 +371,39 @@ func TestAcousticWindowsStayAlignedWhenPacketsArriveLate(t *testing.T) {
 	}
 }
 
-func TestHardwareTrackHoldsCleanLockAgainstSingleMixedPeak(t *testing.T) {
+func TestHardwareTrackRequiresCleanMeasurementBeforeChangingDelay(t *testing.T) {
 	ctrl := NewSyncController(60, true, false)
 	ctrl.SetLowLatencyHwMode(true)
 	now := time.Now()
 	ctrl.EnterAcquire("stream_start")
-	ctrl.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 52.8}, now)
+	ctrl.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 42.1, TvConf: .92}, now)
 	ctrl.MarkJoined()
-	shift := AcousticResult{Valid: true, TvLagMs: 38, AcousticErr: -18, TvConf: .9}
-	ctrl.HandleTrackResult(shift, now.Add(time.Second))
-	if got := ctrl.Snapshot(0, now.Add(time.Second)).LtvMs; got != 52.8 {
-		t.Fatalf("single mixed-window peak must preserve prior TV lock, got %.1f", got)
+
+	// A strong, repeatable mixed peak sent the deployed build to 81 ms.
+	reflection := AcousticResult{Valid: true, TvLagMs: 79.5, AcousticErr: 26.7, TvConf: .9}
+	for i := 0; i < 3; i++ {
+		at := now.Add(30*time.Second + time.Duration(i)*500*time.Millisecond)
+		reacquire, dst, _, _ := ctrl.HandleTrackResult(reflection, at)
+		if reacquire != (i == 2) || dst != 44 || ctrl.Snapshot(0, at).LtvMs != 42.1 {
+			t.Fatalf("mixed peak %d changed clean lock: reacquire=%t dst=%d", i, reacquire, dst)
+		}
 	}
-	ctrl.HandleTrackResult(shift, now.Add(2*time.Second))
-	if got := ctrl.Snapshot(0, now.Add(2*time.Second)).LtvMs; got != 38 {
-		t.Fatalf("confirmed change must update acoustic TV lag, got %.1f", got)
+
+	ctrl.EnterAcquire("verify_tv_with_clean_audio")
+	if dst, _, _ := ctrl.HandleAcquireTimeout(now.Add(34 * time.Second)); dst != 44 {
+		t.Fatalf("failed probe lost prior clean lock: dst=%d", dst)
+	}
+	ctrl.MarkJoined()
+	for i := 0; i < 6; i++ {
+		if retry, _, _, _ := ctrl.HandleTrackResult(reflection, now.Add(35*time.Second+time.Duration(i)*time.Second)); retry {
+			t.Fatal("the same reflection must not trigger repeated pauses during cooldown")
+		}
+	}
+
+	ctrl.EnterAcquire("verify_tv_with_clean_audio")
+	ready, dst, _, _ := ctrl.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 44.92}, now.Add(4*time.Minute))
+	if !ready || dst != 46 {
+		t.Fatalf("expected target to follow independently measured TV audio, got %d", dst)
 	}
 }
 

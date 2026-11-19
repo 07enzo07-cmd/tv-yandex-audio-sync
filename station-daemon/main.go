@@ -399,7 +399,7 @@ func main() {
 	acoustic := NewAcousticEstimator()
 	acoustic.StartPassiveDmaReader()
 
-	fmt.Fprintf(os.Stderr, "[station-rx] v3.2 acoustic tracking fix started on UDP4 %s | closed_loop=%t tv_actuator=%t init_delay=%d ms (dmix H_min=%.0f/Q_min=%.0f ms, hw:0,0 H_min=%.0f/Q_min=%.0f ms)\n",
+	fmt.Fprintf(os.Stderr, "[station-rx] v3.2 clean TV lock started on UDP4 %s | closed_loop=%t tv_actuator=%t init_delay=%d ms (dmix H_min=%.0f/Q_min=%.0f ms, hw:0,0 H_min=%.0f/Q_min=%.0f ms)\n",
 		addr.String(), closedLoop, tvActEnabled, initialDelay, defaultAlsaBaseMs, defaultMinQMs, hwAlsaBaseMs, hwMinQMs)
 
 	var (
@@ -701,7 +701,11 @@ func main() {
 				}
 				sendTelemetry(cmdSeq)
 				if reacq {
-					triggerAcquire("track_large_shift")
+					reason := "track_large_shift"
+					if ctrl.IsLowLatencyHwMode() {
+						reason = "verify_tv_with_clean_audio"
+					}
+					triggerAcquire(reason)
 				}
 			}
 		}
