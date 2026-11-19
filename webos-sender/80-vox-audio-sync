@@ -1,0 +1,90 @@
+#!/bin/sh
+# VOX webOS to Yandex Station Mini 2 Audio Sync Service (v3.0)
+# Starts vox_sender.py with elevated priority during boot
+
+DAEMON=/var/lib/webosbrew/vox_sender.py
+CONF=/var/lib/webosbrew/vox_sync.conf
+PIDFILE=/tmp/vox_audio_sync.pid
+LOGFILE=/tmp/vox_sender.log
+
+start() {
+    if [ -f "$PIDFILE" ]; then
+        PID=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+            echo "[vox-audio-sync] Already running (PID $PID)"
+            return 0
+        fi
+        rm -f "$PIDFILE"
+    fi
+
+    if [ ! -f "$DAEMON" ]; then
+        echo "[vox-audio-sync] Error: $DAEMON not found"
+        return 1
+    fi
+
+    if [ -f "$LOGFILE" ]; then
+        LOGSIZE=$(wc -c < "$LOGFILE" 2>/dev/null || echo 0)
+        if [ "$LOGSIZE" -gt 1048576 ]; then
+            mv -f "$LOGFILE" "${LOGFILE}.1"
+        fi
+    fi
+
+    echo "[vox-audio-sync] Starting audio sender v3.0 daemon..."
+    if command -v nice >/dev/null 2>&1; then
+        ( nice -n -15 /usr/bin/python3 "$DAEMON" --conf "$CONF" --pidfile "$PIDFILE" >> "$LOGFILE" 2>&1 ) </dev/null >/dev/null 2>&1 &
+    else
+        ( /usr/bin/python3 "$DAEMON" --conf "$CONF" --pidfile "$PIDFILE" >> "$LOGFILE" 2>&1 ) </dev/null >/dev/null 2>&1 &
+    fi
+
+    sleep 1
+    if [ -f "$PIDFILE" ]; then
+        PID=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+            echo "[vox-audio-sync] Started successfully (PID $PID)"
+            return 0
+        fi
+    fi
+    echo "[vox-audio-sync] Failed to start (check $LOGFILE)"
+    return 1
+}
+
+stop() {
+    echo "[vox-audio-sync] Stopping audio sender..."
+    if [ -f "$PIDFILE" ]; then
+        PID=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$PID" ]; then
+            kill "$PID" 2>/dev/null || true
+            for i in 1 2 3 4 5; do
+                if ! kill -0 "$PID" 2>/dev/null; then
+                    break
+                fi
+                sleep 0.5
+            done
+            kill -9 "$PID" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE"
+    fi
+    killall arecord 2>/dev/null || true
+    echo "[vox-audio-sync] Stopped"
+}
+
+status() {
+    if [ -f "$PIDFILE" ]; then
+        PID=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+            echo "[vox-audio-sync] Running (PID $PID)"
+            return 0
+        fi
+    fi
+    echo "[vox-audio-sync] Not running"
+    return 3
+}
+
+case "${1:-start}" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; sleep 1; start ;;
+    status) status ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
+exit 0
