@@ -1,4 +1,6 @@
-# Заметки по эксплуатации VOX webOS TV ↔ Яндекс Станция Мини 2 (v3.2)
+# Заметки по эксплуатации VOX webOS TV ↔ Яндекс Станция Мини 2
+
+[Текущее состояние стенда, результаты проверки HDMI и известные ограничения](PROJECT_STATUS.md).
 
 ## Быстрые команды (из корня репозитория)
 * **Деплой (тесты + сборка ARMv7 + Станция + ТВ):** `./deploy-webos.sh`
@@ -10,10 +12,10 @@
   adb -s 192.168.1.132:5555 shell 'grep "\[probe\]" /tmp/station-rx.log | tail -n 5'
   ```
 
-## Важные аппаратные особенности стенда (v3.2)
+## Важные аппаратные особенности стенда
 1. **Двухрежимный вывод ALSA на Станции (`default` dmix + прямой `hw:0,0`):**
    * **Обычный режим (`hw=false`, YouTube / Spotify / медиаплееры):** обратимый `mount --bind /data/audiosync/asound.lowlat.conf /etc/asound.conf` (`dmix 1920/480`, 40 мс буфер / 10 мс период) с однократным перезапуском `maind --mediad` при монтировании (под присмотром `quasar_launcher2`) для выравнивания IPC + `aplay -D default --buffer-size=1440 --period-size=480 -R 20000`. Сохраняет `amixer Master` (`softvol`) и полную совместимость с Алисой ($L_{\text{st,min}} \approx 45\text{–}50\text{ мс}$).
-   * **Режим низкой задержки (`hw=true`, HDMI2 / PS5 Game Mode):** включается автоматически, когда `vox_sender.py` передаёт `FLAG_LOW_LATENCY` (`bit2` в байте 18 `SYN3` для `appId` с префиксом `com.webos.app.hdmi`) ИЛИ когда `ACQUIRE` замеряет $L_{\text{tv}} < 45\text{ мс}$. Использует прямой вывод `aplay -D hw:0,0 --buffer-size=720 --period-size=240 -R 10000` (15 мс буфер / 5 мс период, $Q_{\min}=8\text{ мс}$, $L_{\text{st,min}} \approx 21\text{ мс}$). Поскольку `hw:0,0` обходит ALSA `softvol`, громкость масштабируется в Go (`SoftVolume`) по той же кривой `-51.0..0.0 dB` с плавным 15 мс сглаживанием без щелчков. Если `hw:0,0` занят Алисой (`Device or resource busy`), `station-rx` автоматически откатывается на `default` (`dmix 1920/480`). При Mute / 10 с тишины / Standby `aplay` мгновенно закрывается (`pcm0p = closed`), освобождая устройство для Алисы.
+   * **Режим низкой задержки (`hw=true`, HDMI2 / PS5 Game Mode):** включается автоматически, когда `vox_sender.py` передаёт `FLAG_LOW_LATENCY` (`bit2` в байте 18 `SYN3` для `appId` с префиксом `com.webos.app.hdmi`) ИЛИ когда `ACQUIRE` замеряет $L_{\text{tv}} < 45\text{ мс}$. Использует прямой вывод `aplay -D hw:0,0 --buffer-size=1200 --period-size=240 -R 15000` (25 мс буфер, 5 мс период, 15 мс стартовый порог и минимум очереди 8 мс). Поскольку `hw:0,0` обходит ALSA `softvol`, громкость масштабируется в Go (`SoftVolume`) по той же кривой `-51.0..0.0 dB` с плавным 15 мс сглаживанием без щелчков. Если `hw:0,0` занят Алисой (`Device or resource busy`), `station-rx` автоматически откатывается на `default` (`dmix 1920/480`). При Mute / 10 с тишины / Standby `aplay` мгновенно закрывается (`pcm0p = closed`), освобождая устройство для Алисы.
 2. **Захват `hw:0,12` и отслеживание приложений на VOX webOS:**
    * `MARS DSNOOP` (`hw:0,12`) снимает сигнал *pre-volume* и *pre-mute*. Громкость Станции масштабируется по формуле `round(80 * tv / 12)` (`12 → 80%`, `15+ → 100%`), параметры задаются в `/var/lib/webosbrew/vox_sync.conf`.
    * `vox_sender.py` подписан на `luna://com.webos.applicationManager/getForegroundAppInfo '{"subscribe":true}'`: при переключении приложения/входа выставляет `FLAG_LOW_LATENCY` для `com.webos.app.hdmi*` и отправляет `FLAG_SESSION_RESET`, чтобы Станция сразу запускала чистый `ACQUIRE`.
