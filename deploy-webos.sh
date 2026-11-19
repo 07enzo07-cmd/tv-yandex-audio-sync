@@ -21,7 +21,7 @@ adb -s "$STATION_ADDR" shell '
 chmod +x /data/audiosync/station-rx
 echo "closed_loop" > /data/audiosync/auto_control
 echo "0" > /data/audiosync/tv_actuator_enabled
-echo "87" > /data/audiosync/delay_ms
+echo "56" > /data/audiosync/delay_ms
 /etc/init.d/S99station-rx start
 '
 

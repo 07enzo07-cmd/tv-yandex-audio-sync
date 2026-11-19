@@ -166,10 +166,10 @@ func TestControllerStateMachineAndNoOscillation(t *testing.T) {
 	ctrl := NewSyncController(115, true, true) // dual-actuator enabled for policy test
 	ctrl.EnterAcquire("start")
 
-	// 1. Acquire with L_tv = 67 ms (< L_st_min 87 ms) -> Station to 87 ms, TV delay requested ~20 ms
-	ok, dst, reqDtv, seq := ctrl.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 67.0, TvConf: 0.9}, now)
-	if !ok || dst != 87 || reqDtv != 20 || seq != 1 {
-		t.Fatalf("expected dst=87 reqDtv=20 seq=1, got ok=%t dst=%d reqDtv=%d seq=%d", ok, dst, reqDtv, seq)
+	// 1. Acquire with L_tv = 20 ms (< L_st_min 40 ms) -> Station to 40 ms, TV delay requested ~20 ms
+	ok, dst, reqDtv, seq := ctrl.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 20.0, TvConf: 0.9}, now)
+	if !ok || dst != 40 || reqDtv != 20 || seq != 1 {
+		t.Fatalf("expected dst=40 reqDtv=20 seq=1, got ok=%t dst=%d reqDtv=%d seq=%d", ok, dst, reqDtv, seq)
 	}
 	ctrl.HandleTvap(TvapPacket{AppliedTvDelayMs: 20, Status: tvapStatusOK, CmdSeq: seq})
 	ctrl.MarkJoined()
@@ -177,20 +177,20 @@ func TestControllerStateMachineAndNoOscillation(t *testing.T) {
 		t.Fatalf("expected StateTrack after TVAP, got %s", ctrl.State())
 	}
 
-	// 2. Suppose L_tv rises slightly to 92 ms (margin only +6.5 ms < 10 ms hysteresis) -> MUST NOT drop D_tv to 0!
+	// 2. Suppose L_tv rises slightly to 45 ms (margin only +6.5 ms < 10 ms hysteresis) -> MUST NOT drop D_tv to 0!
 	_, _, reqDtv2, _ := ctrl.HandleTrackResult(AcousticResult{
-		Valid: true, SpkConf: 0.9, SpkLagMs: 87.0, TvLagMs: 112.0, AcousticErr: 25.0, TvConf: 0.9,
+		Valid: true, SpkConf: 0.9, SpkLagMs: 40.0, TvLagMs: 65.0, AcousticErr: 25.0, TvConf: 0.9,
 	}, now.Add(6*time.Second))
 	if reqDtv2 != 20 {
 		t.Fatalf("hysteresis violated: D_tv should remain 20 ms when margin < 10 ms, got %d", reqDtv2)
 	}
 
-	// 3. Test UNREACHABLE when TV actuator disabled and L_tv = 50 ms < L_st_min 87 ms
+	// 3. Test UNREACHABLE when TV actuator disabled and L_tv = 15 ms < L_st_min 40 ms
 	ctrlNoTv := NewSyncController(115, true, false)
 	ctrlNoTv.EnterAcquire("start")
-	ctrlNoTv.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 50.0, TvConf: 0.9}, now)
+	ctrlNoTv.HandleAcquireResult(AcousticResult{Valid: true, TvLagMs: 15.0, TvConf: 0.9}, now)
 	ctrlNoTv.MarkJoined()
-	if ctrlNoTv.State() != StateUnreachable || ctrlNoTv.TargetDelayMs() != 87 {
-		t.Fatalf("expected UNREACHABLE at dst=87, got state=%s dst=%d", ctrlNoTv.State(), ctrlNoTv.TargetDelayMs())
+	if ctrlNoTv.State() != StateUnreachable || ctrlNoTv.TargetDelayMs() != 40 {
+		t.Fatalf("expected UNREACHABLE at dst=40, got state=%s dst=%d", ctrlNoTv.State(), ctrlNoTv.TargetDelayMs())
 	}
 }

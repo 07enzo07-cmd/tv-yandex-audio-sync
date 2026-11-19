@@ -16,11 +16,11 @@ const (
 	tvMinInterval   = 5 * time.Second
 	ltvCacheTTL     = 10 * time.Minute
 
-	// Measured hardware + stock dmix (7680/960, shared with maind) + aplay (2880/960) + 4KB pipe:
-	// Measured live SpkLag - q_ms = 110.4 - 38.0 = 72.4 ms -> H_min = 72 ms, Q_min = 15 ms -> L_st_min = 87 ms
-	defaultAlsaBaseMs   = 72.0
+	// Measured hardware + low-latency dmix (960/240 = 20ms buf, 5ms period) + aplay (720/240 = 15ms buf) + 4KB pipe:
+	// H_min ≈ 25 ms (auto-calibrated live from SpkLag - q_ms), Q_min = 15 ms -> L_st_min = 40 ms
+	defaultAlsaBaseMs   = 25.0
 	defaultMinQMs       = 15.0
-	defaultMinStationMs = 87
+	defaultMinStationMs = 40
 	maxStationMs        = 950
 )
 
@@ -145,6 +145,19 @@ func (c *SyncController) TargetQueueMs() float64 {
 		q = c.minQMs
 	}
 	return q
+}
+
+// UpdateMeasuredAlsaBase continuously auto-calibrates H_measured = SpkLagMs - curQMs
+// so TargetQueueMs() always achieves exact lst == dstMs with sub-millisecond accuracy.
+func (c *SyncController) UpdateMeasuredAlsaBase(spkLagMs, curQMs float64) {
+	h := spkLagMs - curQMs
+	if h < 12.0 || h > 95.0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.alsaBaseMs = 0.20*h + 0.80*c.alsaBaseMs
+	c.minStationMs = int(math.Ceil(c.alsaBaseMs + c.minQMs))
 }
 
 func (c *SyncController) State() SyncState {

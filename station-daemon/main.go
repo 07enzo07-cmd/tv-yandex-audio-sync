@@ -89,8 +89,8 @@ func (p *Player) Start() error {
 	// Omit -q so we can parse real ALSA underrun (XRUN) messages from stderr!
 	cmd := exec.Command("/usr/bin/aplay",
 		"-D", "default",
-		"--buffer-size=2880",
-		"--period-size=960",
+		"--buffer-size=1440",
+		"--period-size=480",
 		"-R", "20000",
 		"-t", "raw",
 		"-f", "S16_LE",
@@ -560,6 +560,10 @@ func main() {
 				}
 
 				res := acoustic.AnalyzeTrackSync(1000, float64(ctrl.TargetDelayMs()))
+				if res.SpkConf >= 0.65 && res.SpkLagMs > 10.0 {
+					curQMs := float64(atomic.LoadInt64(&queuedBytes)+int64(player.PipeQueuedBytes())) / 192.0
+					ctrl.UpdateMeasuredAlsaBase(res.SpkLagMs, curQMs)
+				}
 				reacq, newDst, _, cmdSeq := ctrl.HandleTrackResult(res, time.Now())
 				if res.Valid || res.SpkConf >= 0.55 {
 					fmt.Fprintf(os.Stderr, "[track] epoch=%d spk=%.1f tv=%.1f err=%.1f psr=%.1f contrast=%.2f status=%s dst=%d\n",
@@ -702,7 +706,7 @@ func main() {
 	}()
 
 	// 6. Main Playback Loop with Seamless Fade-In JOIN, Instant Mute Fade-Out, and Separated PLL / Delay Slew
-	silence5ms := make([]byte, 960) // 5 ms stereo S16_LE
+	silence10ms := make([]byte, 1920) // 10 ms stereo S16_LE (matches dmix 480-frame period -> 0 tail XRUNs)
 	retimeBuf := make([]byte, 4096)
 
 	for {
@@ -841,7 +845,7 @@ func main() {
 				}
 
 			case <-timer.C:
-				if err := player.Write(silence5ms); err != nil {
+				if err := player.Write(silence10ms); err != nil {
 					player.Stop()
 					break
 				}
