@@ -386,6 +386,19 @@ type queuedFrame struct {
 
 // Retry a failed clean lock when programme audio becomes measurable. Room
 // estimates made while both speakers play do not count as a clean lock.
+const burstRecoveryDuration = 2 * time.Second
+
+func playbackQueueLimit(targetMs float64, hw, recovering bool) int64 {
+	headroomMs := 180.0
+	if hw {
+		headroomMs = 35
+	}
+	if recovering {
+		headroomMs = 15
+	}
+	return int64((targetMs + headroomMs) * 192)
+}
+
 type acquireRetry struct {
 	epoch            uint64
 	attempts         int
@@ -459,7 +472,7 @@ func main() {
 	acoustic := NewAcousticEstimator()
 	acoustic.StartPassiveDmaReader()
 
-	fmt.Fprintf(os.Stderr, "[station-rx] v3.2 source recovery and de-click started on UDP4 %s | closed_loop=%t tv_actuator=%t init_delay=%d ms (dmix H_min=%.0f/Q_min=%.0f ms, hw:0,0 H_min=%.0f/Q_min=%.0f ms)\n",
+	fmt.Fprintf(os.Stderr, "[station-rx] v3.2 burst recovery started on UDP4 %s | closed_loop=%t tv_actuator=%t init_delay=%d ms (dmix H_min=%.0f/Q_min=%.0f ms, hw:0,0 H_min=%.0f/Q_min=%.0f ms)\n",
 		addr.String(), closedLoop, tvActEnabled, initialDelay, defaultAlsaBaseMs, defaultMinQMs, hwAlsaBaseMs, hwMinQMs)
 
 	var (
@@ -478,19 +491,19 @@ func main() {
 		acquireActive       int32 // 1 while in ACQUIRE/probe (playback paused silently)
 		muteFadeReq         int32 // 1 to trigger immediate 20 ms fade-out & stop
 		maxPacketGapNs      atomic.Int64
+		burstRecoveryUntil  atomic.Int64
 		trackQueueBits      atomic.Uint64
 		atomicLowLatFlag    int32 // 1 when SYN3 FLAG_LOW_LATENCY is set
 	)
 
 	queue := make(chan queuedFrame, 400)
-	enqueue := func(f queuedFrame) {
-		// Bound lateness if playback cannot keep up with the receiver.
-		headroomMs := 180.0
-		if ctrl.IsLowLatencyHwMode() {
-			headroomMs = 35
+	enqueue := func(f queuedFrame, recovering bool) {
+		maxBytes := playbackQueueLimit(ctrl.TargetQueueMs(), ctrl.IsLowLatencyHwMode(), recovering)
+		inFlight := int64(len(f.pcm))
+		if recovering {
+			inFlight += int64(player.PipeQueuedBytes())
 		}
-		maxBytes := int64((ctrl.TargetQueueMs() + headroomMs) * 192.0)
-		for atomic.LoadInt64(&queuedBytes) > maxBytes {
+		for atomic.LoadInt64(&queuedBytes)+inFlight > maxBytes {
 			select {
 			case old := <-queue:
 				atomic.AddInt64(&queuedBytes, -int64(len(old.pcm)))
@@ -601,6 +614,7 @@ func main() {
 		var cleanAcquiredEpoch uint64
 		var retry acquireRetry
 		var lastAcquireEnd time.Time
+		var lastHandledBurst int64
 		for {
 			select {
 			case reason := <-acquireTrigger:
@@ -719,6 +733,14 @@ func main() {
 					continue
 				}
 
+				burst := burstRecoveryUntil.Load()
+				if time.Now().UnixNano() < burst {
+					if burst != lastHandledBurst {
+						acoustic.ResetAccumulator()
+						lastHandledBurst = burst
+					}
+					continue
+				}
 				epoch := atomic.LoadUint64(&playbackEpoch)
 				queueMs := math.Float64frombits(trackQueueBits.Load())
 				trackWindowMs := 1000
@@ -727,7 +749,7 @@ func main() {
 					trackWindowMs = 480
 				}
 				res := acoustic.AnalyzeTrackSync(trackWindowMs, float64(targetMs))
-				if epoch != atomic.LoadUint64(&playbackEpoch) || !player.IsRunning() {
+				if epoch != atomic.LoadUint64(&playbackEpoch) || !player.IsRunning() || burstRecoveryUntil.Load() != burst {
 					continue
 				}
 				now := time.Now()
@@ -866,6 +888,12 @@ func main() {
 				triggerAcquire("stream_start")
 			}
 
+			if wasIdle || pkt.SessionReset || lowLatChanged {
+				burstRecoveryUntil.Store(0)
+			} else if pkt.ProtoVer == 3 && gap >= int64(100*time.Millisecond) {
+				burstRecoveryUntil.Store(nowNano + int64(burstRecoveryDuration))
+				fmt.Fprintf(os.Stderr, "[burst-recovery] seq=%d receive_gap_ms=%.1f\n", pkt.Seq, float64(gap)/float64(time.Millisecond))
+			}
 			ready, majorReset := reorder.Push(pkt)
 			if (majorReset || lowLatChanged) && !wasIdle {
 				atomic.AddUint64(&resyncEvents, 1)
@@ -888,7 +916,10 @@ func main() {
 
 				// Only enqueue for playback when not in silent ACQUIRE
 				if atomic.LoadInt32(&acquireActive) == 0 {
-					enqueue(queuedFrame{seq: rp.Seq, pcm: rp.PCM, frameMs: rp.FrameMs, isPLC: rp.IsPLC})
+					recovering := nowNano < burstRecoveryUntil.Load()
+					if !recovering || !rp.IsPLC {
+						enqueue(queuedFrame{seq: rp.Seq, pcm: rp.PCM, frameMs: rp.FrameMs, isPLC: rp.IsPLC}, recovering)
+					}
 				}
 			}
 		}

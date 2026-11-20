@@ -456,3 +456,12 @@ func TestBridgePCMSmoothsExtremeJumpWithoutChangingDuration(t *testing.T) {
 		t.Fatal("input buffer was modified")
 	}
 }
+
+func TestBurstRecoveryLimitsQueueWithoutChangingNormalHeadroom(t *testing.T) {
+	if got := playbackQueueLimit(25, false, true); got != 40*192 {
+		t.Fatalf("unexpected burst recovery cap: %d", got)
+	}
+	if got := playbackQueueLimit(25, false, false); got != 205*192 {
+		t.Fatalf("unexpected normal playback cap: %d", got)
+	}
+}
