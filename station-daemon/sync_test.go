@@ -417,3 +417,42 @@ func TestConfirmCleanTVRejectsIsolatedModeratePeak(t *testing.T) {
 		t.Fatalf("expected supporting peak to confirm earlier clean measurement, got %+v", got)
 	}
 }
+
+func TestAcquireRetryWaitsForAudioAfterFailedSourceChange(t *testing.T) {
+	var retry acquireRetry
+	audible := AcousticResult{RefRms: .03, MicRms: .0002}
+	for i := 0; i < 3; i++ {
+		if retry.ready(1, 7*time.Second, audible) || retry.ready(1, 9*time.Second, AcousticResult{}) {
+			t.Fatal("measurement must wait for sustained audible source")
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if retry.ready(1, 9*time.Second, audible) != (i == 2) {
+			t.Fatal("expected retry only after three usable windows")
+		}
+	}
+	if retry.ready(1, 30*time.Second, audible) {
+		t.Fatal("retry repeated before cooldown")
+	}
+	for i := 0; i < 3; i++ {
+		if retry.ready(2, 9*time.Second, audible) != (i == 2) {
+			t.Fatal("new source should get its own retry")
+		}
+	}
+}
+
+func TestBridgePCMSmoothsExtremeJumpWithoutChangingDuration(t *testing.T) {
+	pcm := make([]byte, 240*4)
+	for i := range pcm[:192*4] {
+		pcm[i] = 0x7f
+	}
+	previous := [2]int32{-32768, 32767}
+	out := bridgePCM(pcm, nil, previous)
+	if len(out) != len(pcm) || lastStereoFrame(out[:4]) != previous ||
+		string(out[95*4:]) != string(pcm[95*4:]) {
+		t.Fatal("expected contiguous start, unchanged tail and same number of frames")
+	}
+	if pcm[0] != 0x7f {
+		t.Fatal("input buffer was modified")
+	}
+}

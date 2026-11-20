@@ -350,10 +350,70 @@ func applyFade(pcm []byte, startGain, endGain float64) []byte {
 	return out
 }
 
+// Smooth discontinuities over 2 ms without adding any audio frames.
+func bridgePCM(pcm, scratch []byte, previous [2]int32) []byte {
+	frames := min(len(pcm)/4, 96)
+	if frames < 2 {
+		return pcm
+	}
+	if cap(scratch) < len(pcm) {
+		scratch = make([]byte, len(pcm))
+	}
+	out := scratch[:len(pcm)]
+	copy(out, pcm)
+	for i := 0; i < frames; i++ {
+		for ch := range previous {
+			offset := i*4 + ch*2
+			sample := int32(int16(binary.LittleEndian.Uint16(pcm[offset:])))
+			v := previous[ch] + (sample-previous[ch])*int32(i)/int32(frames-1)
+			binary.LittleEndian.PutUint16(out[offset:], uint16(int16(v)))
+		}
+	}
+	return out
+}
+
+func lastStereoFrame(pcm []byte) [2]int32 {
+	frame := pcm[len(pcm)-4:]
+	return [2]int32{int32(int16(binary.LittleEndian.Uint16(frame))), int32(int16(binary.LittleEndian.Uint16(frame[2:])))}
+}
+
 type queuedFrame struct {
+	seq     uint32
 	pcm     []byte
 	frameMs float64
 	isPLC   bool
+}
+
+// Retry a failed clean lock when programme audio becomes measurable. Room
+// estimates made while both speakers play do not count as a clean lock.
+type acquireRetry struct {
+	epoch            uint64
+	attempts         int
+	energeticWindows int
+}
+
+func (r *acquireRetry) ready(epoch uint64, sinceAcquire time.Duration, res AcousticResult) bool {
+	if r.epoch != epoch {
+		*r = acquireRetry{epoch: epoch}
+	}
+	if r.attempts >= 2 {
+		return false
+	}
+	wait := 8 * time.Second
+	if r.attempts > 0 {
+		wait = 45 * time.Second
+	}
+	if sinceAcquire < wait || res.RefRms < 0.008 || res.MicRms < 0.00002 {
+		r.energeticWindows = 0
+		return false
+	}
+	r.energeticWindows++
+	if r.energeticWindows < 3 {
+		return false
+	}
+	r.energeticWindows = 0
+	r.attempts++
+	return true
 }
 
 func main() {
@@ -399,7 +459,7 @@ func main() {
 	acoustic := NewAcousticEstimator()
 	acoustic.StartPassiveDmaReader()
 
-	fmt.Fprintf(os.Stderr, "[station-rx] v3.2 clean TV lock started on UDP4 %s | closed_loop=%t tv_actuator=%t init_delay=%d ms (dmix H_min=%.0f/Q_min=%.0f ms, hw:0,0 H_min=%.0f/Q_min=%.0f ms)\n",
+	fmt.Fprintf(os.Stderr, "[station-rx] v3.2 source recovery and de-click started on UDP4 %s | closed_loop=%t tv_actuator=%t init_delay=%d ms (dmix H_min=%.0f/Q_min=%.0f ms, hw:0,0 H_min=%.0f/Q_min=%.0f ms)\n",
 		addr.String(), closedLoop, tvActEnabled, initialDelay, defaultAlsaBaseMs, defaultMinQMs, hwAlsaBaseMs, hwMinQMs)
 
 	var (
@@ -538,8 +598,8 @@ func main() {
 	// 2. ACQUIRE + TRACK Acoustic Controller Goroutine (also handles cmd_probe & cmd_step)
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
-		var lastRetryEpoch uint64
-		var energeticWindows int
+		var cleanAcquiredEpoch uint64
+		var retry acquireRetry
 		var lastAcquireEnd time.Time
 		for {
 			select {
@@ -551,6 +611,7 @@ func main() {
 				player.Stop()
 				drainQueue()
 				ctrl.EnterAcquire(reason)
+				acquireEpoch := atomic.LoadUint64(&playbackEpoch)
 				sendTelemetry(0)
 				fmt.Fprintf(os.Stderr, "[acquire] Started silent capture (%s)\n", reason)
 
@@ -582,6 +643,9 @@ func main() {
 						break
 					}
 					res := acoustic.AnalyzeCleanTvLag(probeWindowMs, !hwProbe, 6.0, 1.15)
+					if acquireEpoch != atomic.LoadUint64(&playbackEpoch) {
+						break
+					}
 					fmt.Fprintf(os.Stderr, "[acquire-check] ltv=%.2f psr=%.2f contrast=%.2f rms_ref=%.4f rms_mic=%.5f status=%s\n",
 						res.TvLagMs, res.TvPsr, res.Contrast, res.RefRms, res.MicRms, res.Status)
 					if hwProbe {
@@ -601,11 +665,12 @@ func main() {
 						}
 						sendTelemetry(cmdSeq)
 						joined = true
+						cleanAcquiredEpoch = acquireEpoch
 						break
 					}
 					time.Sleep(250 * time.Millisecond)
 				}
-				if !joined && atomic.LoadInt64(&atomicIsMuted) == 0 {
+				if !joined && acquireEpoch == atomic.LoadUint64(&playbackEpoch) && atomic.LoadInt64(&atomicIsMuted) == 0 {
 					newDst, _, cmdSeq := ctrl.HandleAcquireTimeout(time.Now())
 					if !ctrl.IsLowLatencyHwMode() {
 						saveCalibratedDelay(newDst)
@@ -615,7 +680,6 @@ func main() {
 				drainQueue()
 				atomic.StoreInt32(&acquireActive, 0)
 				lastAcquireEnd = time.Now()
-				energeticWindows = 0
 				fmt.Fprintf(os.Stderr, "[acquire] Complete -> JOIN (dst=%d ms, hw=%t, state=%s)\n", ctrl.TargetDelayMs(), ctrl.IsLowLatencyHwMode(), ctrl.State())
 
 			case <-ticker.C:
@@ -673,24 +737,17 @@ func main() {
 						fmt.Fprintf(os.Stderr, "[acoustic-sync] loopback calibration H=%.1f ms targetQ=%.1f ms\n",
 							h, ctrl.TargetQueueMs())
 					}
-					// If startup was too quiet for a clean TV measurement, retry once
-					// after there is sustained programme audio in this playback epoch.
-					snap := ctrl.Snapshot(queueMs, now)
-					if snap.ClosedLoop && snap.LastValidAgeMs < 0 && epoch != lastRetryEpoch && now.Sub(lastAcquireEnd) > 8*time.Second {
-						if res.RefRms >= 0.008 && res.MicRms >= 0.00002 {
-							energeticWindows++
-						} else {
-							energeticWindows = 0
-						}
-						if energeticWindows >= 3 {
-							lastRetryEpoch = epoch
-							triggerAcquire("hdmi_signal_returned")
-						}
-					}
+
 				} else if res.SpkConf >= 0.65 && res.SpkLagMs > 10.0 {
 					curQMs := float64(atomic.LoadInt64(&queuedBytes)+int64(player.PipeQueuedBytes())) / 192.0
 					ctrl.UpdateMeasuredAlsaBase(res.SpkLagMs, curQMs)
 				}
+				closedLoop := ctrl.Snapshot(queueMs, now).ClosedLoop
+				if closedLoop && cleanAcquiredEpoch != epoch && retry.ready(epoch, now.Sub(lastAcquireEnd), res) {
+					triggerAcquire("audio_available_after_failed_lock")
+					continue
+				}
+
 				reacq, newDst, _, cmdSeq := ctrl.HandleTrackResult(res, time.Now())
 				if res.Valid || res.SpkConf >= 0.55 {
 					fmt.Fprintf(os.Stderr, "[track] epoch=%d hw=%t spk=%.1f tv=%.1f err=%.1f psr=%.1f contrast=%.2f status=%s dst=%d\n",
@@ -831,7 +888,7 @@ func main() {
 
 				// Only enqueue for playback when not in silent ACQUIRE
 				if atomic.LoadInt32(&acquireActive) == 0 {
-					enqueue(queuedFrame{pcm: rp.PCM, frameMs: rp.FrameMs, isPLC: rp.IsPLC})
+					enqueue(queuedFrame{seq: rp.Seq, pcm: rp.PCM, frameMs: rp.FrameMs, isPLC: rp.IsPLC})
 				}
 			}
 		}
@@ -952,6 +1009,11 @@ func main() {
 		}
 		timer := time.NewTimer(wait)
 		var frameRemainder float64
+		var previous [2]int32
+		var previousSeq uint32
+		var hasPrevious, previousGap bool
+		lastXruns := player.AlsaXruns()
+		bridgeBuf := make([]byte, 4096)
 
 		for player.IsRunning() {
 			if atomic.LoadInt32(&acquireActive) != 0 {
@@ -1044,6 +1106,17 @@ func main() {
 					out = softVol.ScalePCM(out, softVolBuf, int(atomic.LoadInt64(&atomicStationVolPct)))
 				}
 
+				xruns := player.AlsaXruns()
+				switch {
+				case xruns != lastXruns:
+					out = bridgePCM(out, bridgeBuf, [2]int32{})
+				case hasPrevious && (f.seq != previousSeq+1 || previousGap != f.isPLC):
+					out = bridgePCM(out, bridgeBuf, previous)
+				}
+				lastXruns = xruns
+				previous, previousSeq = lastStereoFrame(out), f.seq
+				hasPrevious, previousGap = true, f.isPLC
+
 				if err := player.Write(out); err != nil {
 					fmt.Fprintf(os.Stderr, "[station-rx] aplay write failed: %v\n", err)
 					player.Stop()
@@ -1057,7 +1130,13 @@ func main() {
 				if actualHw {
 					continue
 				}
-				if err := player.Write(silence10ms); err != nil {
+				out := silence10ms
+				if hasPrevious && previous != [2]int32{} {
+					out = bridgePCM(out, bridgeBuf, previous)
+				}
+				previous = [2]int32{}
+				hasPrevious, previousGap = true, true
+				if err := player.Write(out); err != nil {
 					player.Stop()
 					break
 				}
