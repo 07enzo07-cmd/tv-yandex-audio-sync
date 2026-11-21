@@ -401,8 +401,8 @@ func (c *SyncController) HandleTrackResult(res AcousticResult, now time.Time) (t
 		c.reason = "track_" + res.Status
 		return false, c.dstMs, c.reqDtvMs, c.tvCmdSeq
 	}
-	if c.lowLatencyHwMode {
-		reacquire := c.requestHardwareReacquireLocked(res, now)
+	if c.lowLatencyHwMode || !c.tvActuatorEnabled {
+		reacquire := c.requestCleanReacquireLocked(res, now)
 		return reacquire, c.dstMs, c.reqDtvMs, c.tvCmdSeq
 	}
 
@@ -460,7 +460,7 @@ func (c *SyncController) HandleTrackResult(res AcousticResult, now time.Time) (t
 
 // A mixed HDMI measurement can identify the same reflection in consecutive
 // windows. Use it to request a clean measurement before changing the TV target.
-func (c *SyncController) requestHardwareReacquireLocked(res AcousticResult, now time.Time) bool {
+func (c *SyncController) requestCleanReacquireLocked(res AcousticResult, now time.Time) bool {
 	if !c.closedLoop {
 		c.trackPendingCount = 0
 		c.reason = "observe_only"
@@ -491,6 +491,50 @@ func (c *SyncController) requestHardwareReacquireLocked(res AcousticResult, now 
 	c.state = StateReacquire
 	c.reason = "verify_tv_with_clean_audio"
 	return true
+}
+
+// ResetLiveTracking drops evidence from the previous acoustic source.
+func (c *SyncController) ResetLiveTracking() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.trackPendingCount = 0
+}
+
+func (c *SyncController) HandleLiveTrackResult(res AcousticResult, now time.Time) (int, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.totalChecks++
+	if res.SpkConf >= 0.55 {
+		c.lastLstMs = res.SpkLagMs
+	}
+	err := res.AcousticErr - targetErrMs
+	if !c.closedLoop || !res.Valid || math.Abs(err) <= 5 {
+		c.trackPendingCount = 0
+		c.state = StateHold
+		c.reason = "live_hold"
+		return c.dstMs, false
+	}
+	if math.Abs(c.trackPendingTVMs-res.TvLagMs) > 9 || math.Abs(c.trackPendingErrMs-err) > 9 {
+		c.trackPendingCount = 0
+	}
+	c.trackPendingTVMs, c.trackPendingErrMs = res.TvLagMs, err
+	c.trackPendingCount++
+	if c.trackPendingCount < 3 {
+		c.reason = "live_confirming"
+		return c.dstMs, false
+	}
+	c.trackPendingCount = 0
+	c.validCount++
+	c.hasLtv = true
+	c.ltvBaseMs = res.TvLagMs - float64(c.dtvMs)
+	c.ltvAt, c.lastValidAt, c.lastConf, c.lastErrMs = now, now, res.TvConf, res.AcousticErr
+	step := int(math.Round(math.Max(-12, math.Min(12, err))))
+	next := max(c.minStationMs, min(maxStationMs, c.dstMs+step))
+	changed := next != c.dstMs
+	c.dstMs = next
+	c.state = StateTrack
+	c.reason = "live_corrected"
+	return next, changed
 }
 
 // HandleTvap updates confirmed TV speaker delay from TV's TVAP ack.
@@ -589,7 +633,7 @@ func (c *SyncController) allocateActuatorsLocked(now time.Time) {
 }
 
 // UpdateClockDriftPI corrects sustained rate mismatch from the smoothed queue error.
-func (c *SyncController) UpdateClockDriftPI(qErrMs float64, dtSec float64) float64 {
+func (c *SyncController) UpdateClockDriftPI(qErrMs float64, dtSec float64, syn3 bool) float64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if dtSec <= 0 || dtSec > 5.0 {
@@ -600,9 +644,9 @@ func (c *SyncController) UpdateClockDriftPI(qErrMs float64, dtSec float64) float
 		return c.driftPpm
 	}
 	kp, ki, maxPpm := 4.0, 0.25, 200.0
-	if c.lowLatencyHwMode {
-		// HDMI capture on VOX delivers about 197 nominal 5 ms frames/s.
-		// The 200 ppm crystal correction cannot cover that rate mismatch.
+	if c.lowLatencyHwMode || syn3 {
+		// The VOX capture delivers about 197 nominal 5 ms packets/s
+		// in both output modes. A 200 ppm correction cannot cover that gap.
 		kp, ki, maxPpm = 100.0, 350.0, 20000.0
 	}
 

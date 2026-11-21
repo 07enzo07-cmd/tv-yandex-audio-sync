@@ -620,6 +620,49 @@ func confirmCleanTV(current, previous AcousticResult) (AcousticResult, bool) {
 //  2. Accumulates weighted GCC-PHAT across active speech/music frames over full range [3..950 ms].
 //  3. Does NOT use destructive blind-zone cropping or coherent zero-lag near-field subtraction;
 //     instead cleanly distinguishes outside-overlap TV drift vs inside-overlap HOLD.
+//
+// removeLocalSpeaker projects out the strongest early contribution from
+// the Station's own digital loopback. It leaves channels with weak evidence alone.
+func removeLocalSpeaker(mic, spk []float32) bool {
+	const radius = 24 // 1.5 ms at 16 kHz
+	if len(mic) != len(spk) || len(mic) <= 2*radius {
+		return false
+	}
+	var micPower float64
+	for i := radius; i < len(mic)-radius; i += 4 {
+		micPower += float64(mic[i] * mic[i])
+	}
+	var bestScore float64
+	bestLag := 0
+	for lag := -radius; lag <= radius; lag++ {
+		var cross, power float64
+		for i := radius; i < len(mic)-radius; i += 4 {
+			x := float64(spk[i-lag])
+			cross += x * float64(mic[i])
+			power += x * x
+		}
+		score := cross * cross / (power*micPower + 1e-18)
+		if score > bestScore && power > 1e-10 {
+			bestScore, bestLag = score, lag
+		}
+	}
+	if bestScore < 0.12 {
+		return false
+	}
+	start, end := max(0, bestLag), min(len(mic), len(mic)+bestLag)
+	var cross, energy float64
+	for i := start; i < end; i++ {
+		x := float64(spk[i-bestLag])
+		cross += x * float64(mic[i])
+		energy += x * x
+	}
+	gain := float32(cross / energy)
+	for i := start; i < end; i++ {
+		mic[i] -= gain * spk[i-bestLag]
+	}
+	return true
+}
+
 func (ae *AcousticEstimator) AnalyzeTrackSync(windowMs int, expectedStationDelayMs float64) AcousticResult {
 	ae.dspMu.Lock()
 	defer ae.dspMu.Unlock()
@@ -722,9 +765,13 @@ func (ae *AcousticEstimator) AnalyzeTrackSync(windowMs int, expectedStationDelay
 		return res
 	}
 
-	// 3. Weighted accumulative GCC-PHAT of 4 mics vs ref (NO destructive coherent subtraction)
+	// 3. Weighted GCC-PHAT of the residual microphone signal against the TV reference.
 	clear(ae.corrMag)
+	suppressed := 0
 	for ch := 0; ch < 4; ch++ {
+		if removeLocalSpeaker(micSlices[ch], spkSlice) {
+			suppressed++
+		}
 		for i := 0; i < fftSize; i++ {
 			if i < winSamples {
 				ae.fftB[i] = complex(float64(micSlices[ch][i]), 0)
@@ -776,6 +823,9 @@ func (ae *AcousticEstimator) AnalyzeTrackSync(windowMs int, expectedStationDelay
 
 	spkLagSamples := res.SpkLagMs * 16.0
 	overlapSamples := overlapHalfMs * 16.0
+	if suppressed >= 2 {
+		overlapSamples = 8 * 16
+	}
 
 	best := -1
 	for lag := minLag; lag <= maxLag; lag++ {

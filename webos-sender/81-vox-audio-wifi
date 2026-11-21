@@ -1,0 +1,60 @@
+#!/bin/sh
+# VOX drops LAN packets when its radio repeatedly listens on a P2P channel.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+log=/tmp/vox-audio-wifi.log
+
+case "${1:-start}" in
+  start)
+    flock -n /tmp/vox-audio-wifi.lock "$0" watch </dev/null >/dev/null 2>&1 &
+    exit 0
+    ;;
+  watch) ;;
+  *) exit 0 ;;
+esac
+
+last_event=
+while sleep 4; do
+  if [ -f /var/lib/webosbrew/disable-wifi-direct ]; then
+    if connmanctl technologies 2>/dev/null | awk '
+      /^\/net\/connman\/technology\// { p2p = ($0 == "/net/connman/technology/p2p") }
+      p2p && /^[[:space:]]+Powered = True$/ { enabled = 1 }
+      END { exit !enabled }
+    '; then
+      if connmanctl disable p2p >/dev/null 2>&1; then
+        tail -19 "$log" > "$log.new" 2>/dev/null
+        printf '%s Wi-Fi Direct disabled in ConnMan\n' "$(date -u +%FT%TZ)" >> "$log.new"
+        mv -f "$log.new" "$log"
+      fi
+    fi
+    continue
+  fi
+
+  activity=$(stat -c '%Y' /var/run/vox-audio-active 2>/dev/null) || continue
+  now=$(date +%s)
+  age=$((now - activity))
+  [ "$age" -ge 0 ] && [ "$age" -lt 10 ] || continue
+
+  read -r uptime remainder < /proc/uptime
+  event=$(dmesg 2>/dev/null | awk -v uptime="$uptime" '
+    /ro_ch_handler\(p2p0\) ch:[0-9]+ duration:100,/ {
+      sub(/^[[:space:]]*\[[[:space:]]*/, "")
+      sub(/\].*$/, "")
+      if (uptime >= $0 && uptime - $0 <= 20) stamp = $0
+    }
+    END { if (stamp != "") print stamp }
+  ')
+  [ -n "$event" ] && [ "$event" != "$last_event" ] || continue
+  last_event=$event
+
+  wpa_cli -i wlan0 status 2>/dev/null | grep -qx 'wpa_state=COMPLETED' || continue
+  wpa_cli -i p2p0 status 2>/dev/null | grep -qx 'wpa_state=DISCONNECTED' || continue
+  # An established group can have a separate virtual interface.
+  wpa_cli -i p2p0 interface 2>/dev/null | grep -q '^p2p-' && continue
+
+  if [ "$(wpa_cli -i p2p0 p2p_ext_listen 2>/dev/null)" = OK ]; then
+    tail -19 "$log" > "$log.new" 2>/dev/null
+    printf '%s Wi-Fi Direct background listening stopped (kernel time %s)\n' \
+      "$(date -u +%FT%TZ)" "$event" >> "$log.new"
+    mv -f "$log.new" "$log"
+  fi
+done

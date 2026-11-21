@@ -56,6 +56,9 @@ STATE_NAMES = {
 DEFAULT_STATION_IP = "192.168.1.132"
 DEFAULT_STATION_PORT = 12345
 DEFAULT_ALSA_DEVICE = "hw:0,12"
+AUDIO_ACTIVITY_FILE = "/var/run/vox-audio-active"
+AUDIO_ACTIVITY_INTERVAL = 2.0
+
 DEFAULT_SILENCE_RMS = 20
 DEFAULT_WAKE_RMS = 25
 DEFAULT_SILENCE_TIMEOUT = 10.0
@@ -261,6 +264,8 @@ class VoxAudioSender:
 
         self.running = False
         self.tv_active = True
+        self.power_state = "Active"
+        self.last_audio_activity_write = 0.0
 
         self.tv_volume = 5
         self.station_volume_pct = self.calc_station_volume_pct(5, False)
@@ -476,6 +481,33 @@ class VoxAudioSender:
 
         threading.Thread(target=listener, daemon=True).start()
 
+    def record_audio_activity(self, rms, now, path=AUDIO_ACTIVITY_FILE):
+        if not self.tv_active or rms < self.wake_rms:
+            return
+        if now - self.last_audio_activity_write < AUDIO_ACTIVITY_INTERVAL:
+            return
+        self.last_audio_activity_write = now
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            try:
+                os.utime(fd, None)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+
+    def handle_power_state(self, state):
+        if state == self.power_state:
+            return
+        was_active = self.tv_active
+        self.power_state = state
+        # Power state describes the panel. Media can stay active under a
+        # screensaver or with the panel off. The PCM silence gate still applies.
+        self.tv_active = state in ("Active", "Screen Saver", "Screen Off")
+        print(f"[*] TV power state: {state} (audio_allowed={self.tv_active})", flush=True)
+        if was_active and not self.tv_active:
+            self.tv_actuator.restore()
+
     def _start_power_listener(self):
         def listener():
             cmd = ["/usr/bin/luna-send", "-i", "luna://com.webos.service.tvpower/power/getPowerState", '{"subscribe":true}']
@@ -493,11 +525,7 @@ class VoxAudioSender:
                         try:
                             data = json.loads(line)
                             if data.get("returnValue"):
-                                state = data.get("state", "Active")
-                                was_active = self.tv_active
-                                self.tv_active = (state == "Active")
-                                if was_active and not self.tv_active:
-                                    self.tv_actuator.restore()
+                                self.handle_power_state(data.get("state", "Active"))
                         except Exception:
                             pass
                 except Exception:
@@ -566,7 +594,7 @@ class VoxAudioSender:
                 "-c", "2",
                 "-r", str(self.sample_rate),
                 "--period-size=240",
-                "--buffer-size=960",
+                "--buffer-size=8192",
                 "-t", "raw",
             ]
         else:
@@ -580,7 +608,9 @@ class VoxAudioSender:
                 "--process-time-msec=5",
                 "--raw",
             ]
-        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        # Keep ALSA overruns visible in the sender log for intermittent crackles.
+        stderr = None if self.backend == "alsa" else subprocess.DEVNULL
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr)
 
     def _read_exact_with_watchdog(self, stream, nbytes, timeout_sec=3.0):
         buf = bytearray()
@@ -688,6 +718,7 @@ class VoxAudioSender:
                             break
 
                         rms = calc_rms(chunk)
+                        self.record_audio_activity(rms, now)
                         # Working wake_rms / silence_rms hysteresis!
                         if is_transmitting:
                             if rms >= self.silence_rms:
@@ -732,10 +763,9 @@ class VoxAudioSender:
                             if is_transmitting:
                                 is_transmitting = False
                                 self.silence_pauses += 1
-                                if muted_or_zero:
-                                    seq = self.send_mute_burst(seq, sample_index, count=5)
-                                    sample_index = (sample_index + 5 * CHUNK_FRAMES_48K) & 0xFFFFFFFF
-                                reason = "Standby" if not self.tv_active else (
+                                seq = self.send_mute_burst(seq, sample_index)
+                                sample_index = (sample_index + 5 * CHUNK_FRAMES_48K) & 0xFFFFFFFF
+                                reason = f"Power state: {self.power_state}" if not self.tv_active else (
                                     "Muted/Vol0" if muted_or_zero else f"Silence ({silence_duration:.1f}s)"
                                 )
                                 print(f"[-] Pausing SYN3 TX ({reason}) -> Station ALSA released.", flush=True)

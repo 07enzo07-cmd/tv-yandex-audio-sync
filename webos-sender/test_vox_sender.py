@@ -149,6 +149,28 @@ class TestVoxAudioSenderV3(unittest.TestCase):
         tone = struct.pack("<h", 1200) * (CHUNK_PCM_LEN // 2)
         self.assertAlmostEqual(calc_rms(tone), 1200, delta=20)
 
+    def test_audio_activity_is_recorded_during_screen_saver(self):
+        self.sender.handle_power_state("Screen Saver")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "activity")
+            self.sender.record_audio_activity(0, 10, path)
+            self.assertFalse(os.path.exists(path))
+            self.sender.record_audio_activity(300, 11, path)
+            self.assertTrue(os.path.exists(path))
+            self.sender.handle_power_state("Active Standby")
+            os.unlink(path)
+            self.sender.record_audio_activity(300, 20, path)
+            self.assertFalse(os.path.exists(path))
+
+    def test_panel_power_does_not_stop_playing_media(self):
+        for state in ("Screen Saver", "Screen Off"):
+            self.sender.handle_power_state(state)
+            self.assertTrue(self.sender.tv_active)
+        self.sender.handle_power_state("Active Standby")
+        self.assertFalse(self.sender.tv_active)
+        self.sender.handle_power_state("Active")
+        self.assertTrue(self.sender.tv_active)
+
     def test_foreground_app_low_latency_and_session_reset(self):
         dummy_pcm = b"\x01\x02" * (CHUNK_PCM_LEN // 2)
         # Initial app: YouTube -> no session_reset yet, low_latency=False

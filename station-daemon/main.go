@@ -22,6 +22,8 @@ import (
 const (
 	fcntlSetPipe  = 1031   // F_SETPIPE_SZ on Linux
 	ioctlFionread = 0x541B // FIONREAD on Linux
+	hwGuardFrames = hwStartMs * 48
+	hwGuardMaxGap = 300 * time.Millisecond
 )
 
 func getInitialDelayMs() int {
@@ -162,6 +164,10 @@ func (p *Player) startDevice(hwMode bool) error {
 		return err
 	}
 
+	if err := prioritizePlayback(cmd.Process.Pid); err != nil {
+		fmt.Fprintf(os.Stderr, "[aplay-priority] %v\n", err)
+	}
+
 	exitedCh := make(chan error, 1)
 	go func(c *exec.Cmd, ch chan error) {
 		ch <- c.Wait()
@@ -218,6 +224,35 @@ func (p *Player) PipeQueuedBytes() int {
 		return 0
 	}
 	return int(bytesInPipe)
+}
+
+// hwNeedsConcealment is only checked while the decoder's queue is empty.
+// A pipe with a full period can still feed aplay. The hardware delay also
+// includes any PCM already written to ALSA, which FIONREAD cannot see.
+func (p *Player) hwNeedsConcealment() bool {
+	if p.PipeQueuedBytes() >= hwPeriodMs*192 {
+		return false
+	}
+	status, err := os.ReadFile("/proc/asound/card0/pcm0p/sub0/status")
+	if err != nil {
+		return false
+	}
+	return hwPCMNearlyEmpty(string(status))
+}
+
+func hwPCMNearlyEmpty(status string) bool {
+	state, _, _ := strings.Cut(status, "\n")
+	if strings.TrimSpace(strings.TrimPrefix(state, "state:")) != "RUNNING" {
+		return false
+	}
+	for _, line := range strings.Split(status, "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if ok && strings.TrimSpace(key) == "delay" {
+			frames, err := strconv.Atoi(strings.TrimSpace(value))
+			return err == nil && frames >= 0 && frames <= hwGuardFrames
+		}
+	}
+	return false
 }
 
 func (p *Player) Write(data []byte) error {
@@ -297,33 +332,63 @@ func (p *Player) IsRunning() bool {
 	return p.running
 }
 
-// retimePCM linearly resamples stereo S16_LE PCM from inFrames to outFrames smoothly.
-func retimePCM(src, dst []byte, inFrames, outFrames int) []byte {
-	if inFrames == outFrames || inFrames < 2 || outFrames < 2 {
-		return src
+// PCMRetimer carries fractional timing across UDP packets. Re-anchoring the
+// interpolation at every packet changes the phase periodically, even on a
+// continuous tone.
+type PCMRetimer struct {
+	history [3][2]float64
+	phase   float64
+	rate    float64
+	ready   bool
+}
+
+func (r *PCMRetimer) sample(pcm []byte, frame, channel int) float64 {
+	if frame < 0 {
+		return r.history[frame+3][channel]
 	}
-	needed := outFrames * 4
-	if cap(dst) < needed {
-		dst = make([]byte, needed)
+	return float64(int16(binary.LittleEndian.Uint16(pcm[frame*4+channel*2:])))
+}
+
+func (r *PCMRetimer) convert(pcm, out []byte, rate float64, discontinuity bool) []byte {
+	frames := len(pcm) / 4
+	if frames < 3 {
+		return pcm
 	}
-	dst = dst[:needed]
-	denom := outFrames - 1
-	maxIdx := inFrames - 1
-	for j := 0; j < outFrames; j++ {
-		pos := j * maxIdx
-		i := pos / denom
-		frac := pos % denom
-		next := i + 1
-		if next > maxIdx {
-			next = maxIdx
+	if !r.ready || discontinuity {
+		*r = PCMRetimer{ready: true, rate: rate}
+		first := [2]float64{r.sample(pcm, 0, 0), r.sample(pcm, 0, 1)}
+		for i := range r.history {
+			r.history[i] = first
 		}
+	}
+	r.rate += .12 * (rate - r.rate)
+	step := 1 / (1 + r.rate)
+	needed := (int(math.Ceil(float64(frames)/step)) + 1) * 4
+	if cap(out) < needed {
+		out = make([]byte, needed)
+	}
+	out = out[:needed]
+	written := 0
+	for r.phase < float64(frames) {
+		i := int(r.phase)
+		f := r.phase - float64(i)
 		for ch := 0; ch < 2; ch++ {
-			a := int(int16(binary.LittleEndian.Uint16(src[i*4+ch*2:])))
-			b := int(int16(binary.LittleEndian.Uint16(src[next*4+ch*2:])))
-			binary.LittleEndian.PutUint16(dst[j*4+ch*2:], uint16(int16(a+(b-a)*frac/denom)))
+			a, b := r.sample(pcm, i-3, ch), r.sample(pcm, i-2, ch)
+			c, d := r.sample(pcm, i-1, ch), r.sample(pcm, i, ch)
+			v := b + .5*f*(c-a+f*(2*a-5*b+4*c-d+f*(3*b-3*c+d-a)))
+			v = math.Max(-32768, math.Min(32767, v))
+			binary.LittleEndian.PutUint16(out[written+ch*2:], uint16(int16(math.Round(v))))
+		}
+		written += 4
+		r.phase += step
+	}
+	r.phase -= float64(frames)
+	for i := range r.history {
+		for ch := range r.history[i] {
+			r.history[i][ch] = r.sample(pcm, frames-3+i, ch)
 		}
 	}
-	return dst
+	return out[:written]
 }
 
 // applyFade scales stereo S16_LE PCM linearly from startGain to endGain (0.0..1.0).
@@ -399,34 +464,31 @@ func playbackQueueLimit(targetMs float64, hw, recovering bool) int64 {
 	return int64((targetMs + headroomMs) * 192)
 }
 
-type acquireRetry struct {
-	epoch            uint64
-	attempts         int
-	energeticWindows int
-}
-
-func (r *acquireRetry) ready(epoch uint64, sinceAcquire time.Duration, res AcousticResult) bool {
-	if r.epoch != epoch {
-		*r = acquireRetry{epoch: epoch}
+// Agree across independent microphone windows before updating the target.
+func confirmTvWindows(current AcousticResult, recent []AcousticResult) (AcousticResult, bool) {
+	if current.TvPsr < 4 || current.Contrast < 1.10 || current.RefRms < 0.004 {
+		return AcousticResult{}, false
 	}
-	if r.attempts >= 2 {
-		return false
+	for _, prior := range recent {
+		if prior.TvPsr < 4 || prior.Contrast < 1.10 || prior.RefRms < 0.004 {
+			continue
+		}
+		delta := math.Abs(prior.TvLagMs - current.TvLagMs)
+		// At the noisy edge, require both windows to show a pronounced peak.
+		// Network bursts move the reference time by a few milliseconds.
+		if delta <= 12 && (prior.Valid && current.Valid || prior.TvPsr >= 7 && current.TvPsr >= 7) {
+			current.TvLagMs = (prior.TvLagMs + current.TvLagMs) / 2
+			current.Valid = true
+			return current, true
+		}
+		if delta <= 8 && (prior.Valid || current.Valid) {
+			if prior.Valid && (!current.Valid || prior.TvPsr > current.TvPsr) {
+				return prior, true
+			}
+			return current, true
+		}
 	}
-	wait := 8 * time.Second
-	if r.attempts > 0 {
-		wait = 45 * time.Second
-	}
-	if sinceAcquire < wait || res.RefRms < 0.008 || res.MicRms < 0.00002 {
-		r.energeticWindows = 0
-		return false
-	}
-	r.energeticWindows++
-	if r.energeticWindows < 3 {
-		return false
-	}
-	r.energeticWindows = 0
-	r.attempts++
-	return true
+	return AcousticResult{}, false
 }
 
 func main() {
@@ -479,6 +541,7 @@ func main() {
 		rxPkts              uint64
 		droppedPkts         uint64
 		appStarvation       uint64
+		hwConcealment       uint64
 		plcFrames           uint64
 		silenceRelease      uint64
 		resyncEvents        uint64
@@ -493,6 +556,7 @@ func main() {
 		maxPacketGapNs      atomic.Int64
 		burstRecoveryUntil  atomic.Int64
 		trackQueueBits      atomic.Uint64
+		syn3Stream          atomic.Bool
 		atomicLowLatFlag    int32 // 1 when SYN3 FLAG_LOW_LATENCY is set
 	)
 
@@ -611,16 +675,16 @@ func main() {
 	// 2. ACQUIRE + TRACK Acoustic Controller Goroutine (also handles cmd_probe & cmd_step)
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
-		var cleanAcquiredEpoch uint64
-		var retry acquireRetry
-		var lastAcquireEnd time.Time
+		var trackEpoch uint64
 		var lastHandledBurst int64
 		for {
 			select {
 			case reason := <-acquireTrigger:
 				if atomic.LoadInt64(&atomicIsMuted) != 0 {
+					atomic.StoreInt32(&acquireActive, 0)
 					continue
 				}
+				started := time.Now()
 				atomic.StoreInt32(&acquireActive, 1)
 				player.Stop()
 				drainQueue()
@@ -629,26 +693,15 @@ func main() {
 				sendTelemetry(0)
 				fmt.Fprintf(os.Stderr, "[acquire] Started silent capture (%s)\n", reason)
 
-				// On app/input switch, allow webOS ~850 ms to transition audio pipeline before resetting accumulator
-				if reason == "session_reset" || reason == "low_lat_switch" {
-					time.Sleep(850 * time.Millisecond)
-				}
 				acoustic.ResetAccumulator()
-				probeWindowMs := 800
-				probeDuration := 2200 * time.Millisecond
-				hwProbe := ctrl.IsLowLatencyHwMode()
-				if hwProbe {
-					// Short windows limit decorrelation between the VOX capture
-					// clock and the Station microphone clock.
-					probeWindowMs = 420
-					probeDuration = 3000 * time.Millisecond
-				}
-				deadline := time.Now().Add(probeDuration)
-				var previousTv AcousticResult
-				// Wait minimum 450 ms to accumulate clean audio before first FFT
-				time.Sleep(450 * time.Millisecond)
+				probeWindows := [...]int{420, 500, 480}
+				deadline := started.Add(1780 * time.Millisecond)
+				var recent [4]AcousticResult
+				sampleCount := 0
+				// Leave room for the first packets to align with the microphone ring.
+				time.Sleep(time.Duration(probeWindows[0]+170) * time.Millisecond)
 				joined := false
-				for time.Now().Before(deadline) {
+				for time.Until(deadline) > 100*time.Millisecond {
 					if atomic.LoadInt64(&atomicIsMuted) != 0 {
 						break
 					}
@@ -656,30 +709,34 @@ func main() {
 					if last > 0 && (time.Now().UnixNano()-last) > int64(1200*time.Millisecond) {
 						break
 					}
-					res := acoustic.AnalyzeCleanTvLag(probeWindowMs, !hwProbe, 6.0, 1.15)
+					capturedAt := time.Now()
+					res := acoustic.AnalyzeCleanTvLag(probeWindows[sampleCount%len(probeWindows)], false, 5.0, 1.15)
 					if acquireEpoch != atomic.LoadUint64(&playbackEpoch) {
 						break
 					}
-					fmt.Fprintf(os.Stderr, "[acquire-check] ltv=%.2f psr=%.2f contrast=%.2f rms_ref=%.4f rms_mic=%.5f status=%s\n",
-						res.TvLagMs, res.TvPsr, res.Contrast, res.RefRms, res.MicRms, res.Status)
-					if hwProbe {
-						candidate, ready := confirmCleanTV(res, previousTv)
-						if res.TvPsr >= 5 && res.Contrast >= 1.1 && res.RefRms >= 0.004 {
-							previousTv = res
+					fmt.Fprintf(os.Stderr, "[acquire-check] ltv=%.2f psr=%.2f contrast=%.2f rms_ref=%.4f rms_mic=%.5f status=%s\n", res.TvLagMs, res.TvPsr, res.Contrast, res.RefRms, res.MicRms, res.Status)
+					candidate, ready := confirmTvWindows(res, recent[:])
+					recent[sampleCount%len(recent)] = res
+					sampleCount++
+					if !ready {
+						next := time.Duration(probeWindows[sampleCount%len(probeWindows)]) * time.Millisecond
+						// The microphone keeps collecting during analysis. Count
+						// that time toward the next independent window.
+						nextAt := capturedAt.Add(next)
+						if !nextAt.Add(100 * time.Millisecond).Before(deadline) {
+							break
 						}
-						if !ready {
-							time.Sleep(300 * time.Millisecond)
-							continue
-						}
-						res = candidate
+						time.Sleep(time.Until(nextAt))
+						continue
 					}
+					res = candidate
+					fmt.Fprintf(os.Stderr, "[acquire-confirmed] independent TV peak %.2f ms\n", res.TvLagMs)
 					if ok, newDst, _, cmdSeq := ctrl.HandleAcquireResult(res, time.Now()); ok {
 						if !ctrl.IsLowLatencyHwMode() {
 							saveCalibratedDelay(newDst)
 						}
 						sendTelemetry(cmdSeq)
 						joined = true
-						cleanAcquiredEpoch = acquireEpoch
 						break
 					}
 					time.Sleep(250 * time.Millisecond)
@@ -693,8 +750,7 @@ func main() {
 				}
 				drainQueue()
 				atomic.StoreInt32(&acquireActive, 0)
-				lastAcquireEnd = time.Now()
-				fmt.Fprintf(os.Stderr, "[acquire] Complete -> JOIN (dst=%d ms, hw=%t, state=%s)\n", ctrl.TargetDelayMs(), ctrl.IsLowLatencyHwMode(), ctrl.State())
+				fmt.Fprintf(os.Stderr, "[acquire] Complete -> JOIN (dst=%d ms, hw=%t, state=%s, elapsed_ms=%d)\n", ctrl.TargetDelayMs(), ctrl.IsLowLatencyHwMode(), ctrl.State(), time.Since(started).Milliseconds())
 
 			case <-ticker.C:
 				// Check manual diagnostic probe trigger: /data/audiosync/cmd_probe
@@ -742,6 +798,11 @@ func main() {
 					continue
 				}
 				epoch := atomic.LoadUint64(&playbackEpoch)
+				if trackEpoch != epoch {
+					trackEpoch = epoch
+					acoustic.ResetAccumulator()
+					ctrl.ResetLiveTracking()
+				}
 				queueMs := math.Float64frombits(trackQueueBits.Load())
 				trackWindowMs := 1000
 				targetMs := ctrl.TargetDelayMs()
@@ -764,13 +825,10 @@ func main() {
 					curQMs := float64(atomic.LoadInt64(&queuedBytes)+int64(player.PipeQueuedBytes())) / 192.0
 					ctrl.UpdateMeasuredAlsaBase(res.SpkLagMs, curQMs)
 				}
-				closedLoop := ctrl.Snapshot(queueMs, now).ClosedLoop
-				if closedLoop && cleanAcquiredEpoch != epoch && retry.ready(epoch, now.Sub(lastAcquireEnd), res) {
-					triggerAcquire("audio_available_after_failed_lock")
-					continue
+				newDst, corrected := ctrl.HandleLiveTrackResult(res, now)
+				if corrected {
+					fmt.Fprintf(os.Stderr, "[live-sync] corrected target to %d ms (residual=%+.1f ms)\n", newDst, res.AcousticErr)
 				}
-
-				reacq, newDst, _, cmdSeq := ctrl.HandleTrackResult(res, time.Now())
 				if res.Valid || res.SpkConf >= 0.55 {
 					fmt.Fprintf(os.Stderr, "[track] epoch=%d hw=%t spk=%.1f tv=%.1f err=%.1f psr=%.1f contrast=%.2f status=%s dst=%d\n",
 						atomic.LoadUint64(&playbackEpoch), ctrl.IsLowLatencyHwMode(), res.SpkLagMs, res.TvLagMs, res.AcousticErr, res.TvPsr, res.Contrast, res.Status, newDst)
@@ -778,14 +836,7 @@ func main() {
 				if !ctrl.IsLowLatencyHwMode() {
 					saveCalibratedDelay(newDst)
 				}
-				sendTelemetry(cmdSeq)
-				if reacq {
-					reason := "track_large_shift"
-					if ctrl.IsLowLatencyHwMode() {
-						reason = "verify_tv_with_clean_audio"
-					}
-					triggerAcquire(reason)
-				}
+				sendTelemetry(0)
 			}
 		}
 	}()
@@ -839,6 +890,7 @@ func main() {
 				continue
 			}
 
+			syn3Stream.Store(pkt.ProtoVer == 3)
 			tvAddrMu.Lock()
 			lastTvAddr = srcAddr
 			tvAddrMu.Unlock()
@@ -883,6 +935,7 @@ func main() {
 
 			if wasIdle {
 				reorder.Reset()
+				atomic.StoreInt32(&acquireActive, 1)
 				ctrl.SetLowLatencyHwMode(pkt.LowLatency)
 				atomic.AddUint64(&playbackEpoch, 1)
 				triggerAcquire("stream_start")
@@ -898,13 +951,8 @@ func main() {
 			if (majorReset || lowLatChanged) && !wasIdle {
 				atomic.AddUint64(&resyncEvents, 1)
 				atomic.AddUint64(&playbackEpoch, 1)
-				ctrl.SetLowLatencyHwMode(pkt.LowLatency)
-				drainQueue()
-				reason := "session_reset"
-				if lowLatChanged && !majorReset {
-					reason = "low_lat_switch"
-				}
-				triggerAcquire(reason)
+				// A source marker during an active stream resets DSP tracking.
+				// Keep feeding the current playback route until the stream goes idle.
 			}
 
 			for _, rp := range ready {
@@ -939,17 +987,17 @@ func main() {
 			if snap.TotalChecks > 0 {
 				validRate = float64(snap.ValidCount) / float64(snap.TotalChecks)
 			}
-			fmt.Fprintf(os.Stderr, "[tel] state=%s cl=%t hw=%t ltv=%.1f lst=%.1f err=%+.1f conf=%.2f age_ms=%d vrate=%.2f dst=%d dtv=%d q_ms=%.1f drift=%.0fppm max_rx_gap_ms=%.1f | rx=%d drop=%d xrun=%d starv=%d plc=%d loss=%d reord=%d rel=%d reason=%s\n",
+			fmt.Fprintf(os.Stderr, "[tel] state=%s cl=%t hw=%t ltv=%.1f lst=%.1f err=%+.1f conf=%.2f age_ms=%d vrate=%.2f dst=%d dtv=%d q_ms=%.1f drift=%.0fppm max_rx_gap_ms=%.1f | rx=%d drop=%d xrun=%d starv=%d plc=%d loss=%d reord=%d rel=%d hw_fill=%d reason=%s\n",
 				snap.State, snap.ClosedLoop, snap.HwMode, snap.LtvMs, snap.LstMs, snap.ErrMs, snap.Conf, snap.LastValidAgeMs,
 				validRate, snap.DstMs, snap.DtvMs, snap.QMs, snap.DriftPpm, float64(maxPacketGapNs.Swap(0))/float64(time.Millisecond),
 				rx, atomic.LoadUint64(&droppedPkts), player.AlsaXruns(), atomic.LoadUint64(&appStarvation),
 				atomic.LoadUint64(&plcFrames), reorder.LossCount, reorder.ReorderCnt, atomic.LoadUint64(&silenceRelease),
-				snap.Reason)
+				atomic.LoadUint64(&hwConcealment), snap.Reason)
 		}
 	}()
 
 	// 6. Main Playback Loop with Seamless Fade-In JOIN, Instant Mute Fade-Out, and Separated PLL / Delay Slew
-	silence10ms := make([]byte, 1920) // 10 ms stereo S16_LE (matches dmix 480-frame period -> 0 tail XRUNs)
+	silence10ms := make([]byte, 1920) // 10 ms stereo S16_LE (one dmix period)
 	retimeBuf := make([]byte, 4096)
 	softVolBuf := make([]byte, 4096)
 	var softVol SoftVolume
@@ -1034,12 +1082,16 @@ func main() {
 		trackQueueBits.Store(math.Float64bits(windowQueueMs))
 		lastPiTime := time.Now()
 		fadeInMsLeft := 40.0 // 40 ms linear fade-in on JOIN
-		wait := 25 * time.Millisecond
-		if actualHw {
-			wait = 10 * time.Millisecond
+		steadyWait := 25 * time.Millisecond
+		if syn3Stream.Load() {
+			steadyWait = 20 * time.Millisecond
 		}
+		if actualHw {
+			steadyWait = hwPeriodMs * time.Millisecond
+		}
+		wait := steadyWait
 		timer := time.NewTimer(wait)
-		var frameRemainder float64
+		var retimer PCMRetimer
 		var previous [2]int32
 		var previousSeq uint32
 		var hasPrevious, previousGap bool
@@ -1079,6 +1131,7 @@ func main() {
 
 			select {
 			case f := <-queue:
+				wait = steadyWait
 				atomic.AddInt64(&queuedBytes, -int64(len(f.pcm)))
 				targetQMs = ctrl.TargetQueueMs()
 				curQMs := float64(atomic.LoadInt64(&queuedBytes)+int64(player.PipeQueuedBytes())) / 192.0
@@ -1087,40 +1140,20 @@ func main() {
 				errQMs := emaQMs - targetQMs
 				now := time.Now()
 				dt := now.Sub(lastPiTime).Seconds()
-				driftPpm := ctrl.UpdateClockDriftPI(errQMs, dt)
+				driftPpm := ctrl.UpdateClockDriftPI(errQMs, dt, syn3Stream.Load())
 				if actualHw {
 					windowQueueMs += math.Min(1, dt/0.65) * (curQMs - windowQueueMs)
 					trackQueueBits.Store(math.Float64bits(windowQueueMs))
 				}
 				lastPiTime = now
 
-				// Combine fast queue correction with sustained rate correction.
-				inFrames := len(f.pcm) / 4
-				outFrames := inFrames
-				if inFrames >= 48 {
-					var rateDelta float64
-					// Sustained sender/receiver rate mismatch.
-					rateDelta -= driftPpm * 1e-6
-					// Delay slew component for |errQMs| > 3 ms (up to ±1.5%)
-					if math.Abs(errQMs) > 3.0 {
-						slew := math.Max(-0.015, math.Min(0.015, errQMs*0.0008))
-						rateDelta -= slew
-					}
-					frameDelta := float64(inFrames) * rateDelta
-					if actualHw {
-						frameDelta += frameRemainder
-					}
-					deltaFrames := int(math.Round(frameDelta))
-					frameRemainder = frameDelta - float64(deltaFrames)
-					if deltaFrames != 0 {
-						outFrames = inFrames + deltaFrames
-					}
+				// Keep the sampling phase continuous while the queue servo changes its rate.
+				rate := -driftPpm * 1e-6
+				if math.Abs(errQMs) > 3 {
+					rate -= math.Max(-0.015, math.Min(0.015, errQMs*0.0008))
 				}
-
-				out := f.pcm
-				if outFrames != inFrames {
-					out = retimePCM(f.pcm, retimeBuf, inFrames, outFrames)
-				}
+				discontinuity := hasPrevious && (f.seq != previousSeq+1 || previousGap != f.isPLC)
+				out := retimer.convert(f.pcm, retimeBuf, rate, discontinuity)
 
 				if fadeInMsLeft > 0 {
 					startG := (40.0 - fadeInMsLeft) / 40.0
@@ -1141,7 +1174,7 @@ func main() {
 				switch {
 				case xruns != lastXruns:
 					out = bridgePCM(out, bridgeBuf, [2]int32{})
-				case hasPrevious && (f.seq != previousSeq+1 || previousGap != f.isPLC):
+				case discontinuity:
 					out = bridgePCM(out, bridgeBuf, previous)
 				}
 				lastXruns = xruns
@@ -1155,13 +1188,29 @@ func main() {
 				}
 
 			case <-timer.C:
-				atomic.AddUint64(&appStarvation, 1)
-				// A timer cannot tell whether ALSA has already buffered enough PCM.
-				// In direct mode, extra silence would alter the stream's latency.
-				if actualHw {
-					continue
-				}
 				out := silence10ms
+				if actualHw {
+					// Give arriving audio priority over padding. Leave deliberate
+					// source pauses to the existing idle/rejoin path.
+					packetAge := time.Now().UnixNano() - atomic.LoadInt64(&lastPacketNano)
+					if len(queue) != 0 || packetAge > int64(hwGuardMaxGap) || !player.hwNeedsConcealment() {
+						continue
+					}
+					if len(queue) != 0 {
+						continue
+					}
+					out = out[:hwPeriodMs*192]
+					atomic.AddUint64(&hwConcealment, 1)
+				} else if syn3Stream.Load() {
+					// After a dry input period, feed dmix at its playback cadence.
+					// Ten milliseconds of PCM every twenty or twenty-five milliseconds
+					// drains the mixer and can force the amplifier to restart.
+					wait = 10 * time.Millisecond
+					if len(queue) != 0 || player.PipeQueuedBytes() >= len(silence10ms) {
+						continue
+					}
+				}
+				atomic.AddUint64(&appStarvation, 1)
 				if hasPrevious && previous != [2]int32{} {
 					out = bridgePCM(out, bridgeBuf, previous)
 				}

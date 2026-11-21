@@ -1,0 +1,88 @@
+diff --git a/server/lib/saverpoweroff.js b/server/lib/saverpoweroff.js
+index 4af31c5..0dfcf82 100644
+--- a/server/lib/saverpoweroff.js
++++ b/server/lib/saverpoweroff.js
+@@ -7,6 +7,7 @@
+  * Strict ES5 for Node 0.12.2 on webOS 4.
+  */
+ var power = require('./power');
++var fs = require('fs');
+ 
+ var MAX_MINUTES = 1440;
+ 
+@@ -19,6 +20,12 @@ var later = function (fn, ms) {
+   var timer = setTimeout(fn, ms);
+   return function () { clearTimeout(timer); };
+ };
++var lastAudioActivity = readAudioActivity;
++function readAudioActivity() {
++  try { return fs.statSync('/var/run/vox-audio-active').mtime.getTime(); }
++  catch (e) { return 0; }
++}
++
+ var listening = false;
+ // The wait under way: { minutes, since, cancel }.
+ var pending = null;
+@@ -68,6 +75,17 @@ function fire(wait) {
+   var n = wait.minutes;
+   // The state is read again: the change that ended the screen saver may still be on its way.
+   if (!inScreenSaver(powerState()) || minutes() !== n) return;
++  var now = Date.now();
++  var lastAudio = lastAudioActivity();
++  var audioIdle = now - lastAudio;
++  var interval = n * 60000;
++  if (lastAudio > 0 && audioIdle >= 0 && audioIdle < interval) {
++    var remaining = interval - audioIdle;
++    console.log('saver-poweroff: sound activity extends the wait by ' + Math.ceil(remaining / 1000) + ' s');
++    wait.cancel = later(function () { fire(wait); }, remaining);
++    pending = wait;
++    return;
++  }
+   console.log('saver-poweroff: screen saver on for ' + n + ' min, switching the TV off');
+   control('powerOff', null, function (r) {
+     if (!r || !r.ok) console.error('saver-poweroff: powerOff failed: ' + ((r && r.error) || 'no answer'));
+@@ -126,6 +144,7 @@ function init(opts) {
+   config = opts.config;
+   liveState = opts.liveState || null;
+   control = opts.control;
++  lastAudioActivity = opts.lastAudioActivity || readAudioActivity;
+   if (opts.later) later = opts.later;
+ }
+ 
+diff --git a/test/test-saver-poweroff.js b/test/test-saver-poweroff.js
+index 9d2379b..4b0ca7f 100644
+--- a/test/test-saver-poweroff.js
++++ b/test/test-saver-poweroff.js
+@@ -8,7 +8,7 @@ var StateManager = require('../server/lib/state').StateManager;
+ 
+ console.log('Running test-saver-poweroff.js ...');
+ 
+-function setup(minutes, state) {
++function setup(minutes, state, lastAudioActivity) {
+   var states = new StateManager();
+   if (state) states.update('power', 'state', state);
+   var config = { allowPower: true };
+@@ -16,6 +16,7 @@ function setup(minutes, state) {
+   var calls = [], waiting = [];
+   saverPowerOff.init({
+     config: config,
++    lastAudioActivity: lastAudioActivity || function () { return 0; },
+     liveState: { state: states },
+     control: function (action, value, cb) { calls.push(action); cb({ ok: true }); },
+     later: function (fn, ms) {
+@@ -111,3 +112,15 @@ function setup(minutes, state) {
+ })();
+ 
+ console.log('test-saver-poweroff.js passed');
++
++(function testSoundDefersStandby() {
++  var recent = Date.now() - 1000;
++  var t = setup(30, 'Screen Saver', function () { return recent; });
++  t.live()[0].fn();
++  assert.deepEqual(t.calls, []);
++  assert.ok(t.live()[1].ms > 1790000 && t.live()[1].ms < 1800000);
++  recent = Date.now() - 1801000;
++  t.live()[1].fn();
++  assert.deepEqual(t.calls, ['powerOff']);
++  console.log('  ✓ audio postpones standby until there has been enough silence');
++})();

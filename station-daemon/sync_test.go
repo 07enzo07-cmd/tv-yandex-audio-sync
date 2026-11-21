@@ -297,7 +297,7 @@ func TestHDMIClockCorrectionHandlesCaptureRate(t *testing.T) {
 	ctrl.SetLowLatencyHwMode(true)
 	var ppm float64
 	for i := 0; i < 12; i++ {
-		ppm = ctrl.UpdateClockDriftPI(-4, 1)
+		ppm = ctrl.UpdateClockDriftPI(-4, 1, false)
 	}
 	if ppm > -13000 || ppm < -20000 {
 		t.Fatalf("expected correction for ~197 frames/s, got %.0f ppm", ppm)
@@ -418,29 +418,6 @@ func TestConfirmCleanTVRejectsIsolatedModeratePeak(t *testing.T) {
 	}
 }
 
-func TestAcquireRetryWaitsForAudioAfterFailedSourceChange(t *testing.T) {
-	var retry acquireRetry
-	audible := AcousticResult{RefRms: .03, MicRms: .0002}
-	for i := 0; i < 3; i++ {
-		if retry.ready(1, 7*time.Second, audible) || retry.ready(1, 9*time.Second, AcousticResult{}) {
-			t.Fatal("measurement must wait for sustained audible source")
-		}
-	}
-	for i := 0; i < 3; i++ {
-		if retry.ready(1, 9*time.Second, audible) != (i == 2) {
-			t.Fatal("expected retry only after three usable windows")
-		}
-	}
-	if retry.ready(1, 30*time.Second, audible) {
-		t.Fatal("retry repeated before cooldown")
-	}
-	for i := 0; i < 3; i++ {
-		if retry.ready(2, 9*time.Second, audible) != (i == 2) {
-			t.Fatal("new source should get its own retry")
-		}
-	}
-}
-
 func TestBridgePCMSmoothsExtremeJumpWithoutChangingDuration(t *testing.T) {
 	pcm := make([]byte, 240*4)
 	for i := range pcm[:192*4] {
@@ -463,5 +440,102 @@ func TestBurstRecoveryLimitsQueueWithoutChangingNormalHeadroom(t *testing.T) {
 	}
 	if got := playbackQueueLimit(25, false, false); got != 205*192 {
 		t.Fatalf("unexpected normal playback cap: %d", got)
+	}
+}
+
+func TestCleanTvLockNeedsAgreementAcrossWindows(t *testing.T) {
+	weak := AcousticResult{TvLagMs: 134.9, TvPsr: 4.19, Contrast: 1.13, RefRms: .17}
+	good := AcousticResult{Valid: true, TvLagMs: 135.4, TvPsr: 5.56, Contrast: 1.16, RefRms: .16}
+	unrelated := good
+	unrelated.TvLagMs = 31.2
+	if _, ok := confirmTvWindows(unrelated, []AcousticResult{weak}); ok {
+		t.Fatal("a lone peak must not change the TV delay")
+	}
+	if got, ok := confirmTvWindows(good, []AcousticResult{weak}); !ok || got.TvLagMs != 135.4 {
+		t.Fatalf("independent nearby peaks should confirm the delay: %+v", got)
+	}
+}
+
+func TestSyn3RateCorrectionAlsoWorksThroughDmix(t *testing.T) {
+	ctrl := NewSyncController(135, true, false)
+	var ppm float64
+	for i := 0; i < 10; i++ {
+		ppm = ctrl.UpdateClockDriftPI(-4, 1, true)
+	}
+	if ppm > -12000 {
+		t.Fatalf("SYN3 compensation in dmix cannot match the observed capture rate: %.0f ppm", ppm)
+	}
+}
+
+func TestLiveTrackingCorrectsOnlyConfirmedResidual(t *testing.T) {
+	ctrl := NewSyncController(100, true, false)
+	res := AcousticResult{Valid: true, TvLagMs: 120, SpkLagMs: 100, SpkConf: .9, AcousticErr: 20}
+	for i := 0; i < 3; i++ {
+		dst, changed := ctrl.HandleLiveTrackResult(res, time.Now())
+		if i < 2 && (changed || dst != 100) || i == 2 && (!changed || dst != 112) {
+			t.Fatalf("window %d: dst=%d changed=%t", i, dst, changed)
+		}
+	}
+}
+
+func TestLocalSpeakerProjectionKeepsDelayedExternalSignal(t *testing.T) {
+	const samples = 8192
+	loop, mic, external := make([]float32, samples), make([]float32, samples), make([]float32, samples)
+	var state uint32 = 29
+	for i := range loop {
+		state = state*1664525 + 1013904223
+		loop[i] = float32(int32(state)) / 2147483648
+	}
+	for i := 8; i < samples; i++ {
+		if i >= 320 {
+			external[i] = .2 * loop[i-320]
+		}
+		mic[i] = .7*loop[i-8] + external[i]
+	}
+	if !removeLocalSpeaker(mic, loop) {
+		t.Fatal("expected local source detection")
+	}
+	var errorPower, externalPower float64
+	for i := 400; i < samples-32; i++ {
+		d := mic[i] - external[i]
+		errorPower += float64(d * d)
+		externalPower += float64(external[i] * external[i])
+	}
+	if errorPower > externalPower*.02 {
+		t.Fatalf("speaker subtraction removed or distorted the distinct delayed signal: %.3f", errorPower/externalPower)
+	}
+}
+
+func TestPCMRetimerPreservesPhaseAcrossPacketBoundaries(t *testing.T) {
+	const packetFrames = 240
+	const packets = 100
+	const rate = .013
+	const omega = 2 * math.Pi * .1
+	var retimer PCMRetimer
+	count, countCompared := 0, 0
+	var errorPower float64
+	for packet := 0; packet < packets; packet++ {
+		pcm := make([]byte, packetFrames*4)
+		for i := 0; i < packetFrames; i++ {
+			value := uint16(int16(10000 * math.Sin(float64(packet*packetFrames+i)*omega)))
+			binary.LittleEndian.PutUint16(pcm[i*4:], value)
+			binary.LittleEndian.PutUint16(pcm[i*4+2:], value)
+		}
+		output := retimer.convert(pcm, nil, rate, false)
+		for i := 0; i < len(output); i += 4 {
+			if count > 5 {
+				want := 10000 * math.Sin((float64(count)/(1+rate)-2)*omega)
+				got := float64(int16(binary.LittleEndian.Uint16(output[i:])))
+				errorPower += (want - got) * (want - got)
+				countCompared++
+			}
+			count++
+		}
+	}
+	if math.Abs(float64(count)-packetFrames*packets*(1+rate)) > 1 {
+		t.Fatalf("unexpected output frame count %d", count)
+	}
+	if rms := math.Sqrt(errorPower / float64(countCompared)); rms > 55 {
+		t.Fatalf("retiming adds excessive error across packet boundaries: %.2f RMS", rms)
 	}
 }

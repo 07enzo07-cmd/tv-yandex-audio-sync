@@ -15,6 +15,11 @@ func setPdeathsig(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
 }
 
+func prioritizePlayback(pid int) error {
+	// Favor PCM writes over FFT and logging without using real-time scheduling.
+	return syscall.Setpriority(syscall.PRIO_PROCESS, pid, -5)
+}
+
 // ensureLowLatAsoundMount reversibly bind-mounts /data/audiosync/asound.lowlat.conf (dmix 960/240)
 // onto /etc/asound.conf and cleanly respawns maind --mediad (supervised by quasar_launcher2)
 // ONLY when newly mounted so both Alice and aplay share the 960/240 dmix IPC without EINVAL.
