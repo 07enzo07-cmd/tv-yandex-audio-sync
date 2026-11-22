@@ -30,6 +30,20 @@ class TestVoxAudioSenderV3(unittest.TestCase):
     def setUp(self):
         self.sender = VoxAudioSender(conf_path="/nonexistent")
 
+    def test_bluetooth_output_switch(self):
+        def notify(output):
+            return self.sender.handle_sound_output({
+                "returnValue": True, "settings": {"soundOutput": output},
+            })
+
+        for output in ("bt_soundbar", "tv_speaker_bluetooth", "tv_speaker_bt_surround"):
+            self.assertTrue(notify(output))
+            self.assertTrue(self.sender.bluetooth_output)
+            self.assertFalse(self.sender.handle_sound_output({"returnValue": False}))
+            self.assertTrue(self.sender.bluetooth_output)
+            self.assertTrue(notify("tv_speaker"))
+            self.assertFalse(self.sender.bluetooth_output)
+
     def test_volume_mapping(self):
         # Phase 4 spec: TV=12 -> 80% (level 8), TV=15+ -> 100%, no cap at 6!
         expected = {

@@ -508,7 +508,9 @@ func (c *SyncController) HandleLiveTrackResult(res AcousticResult, now time.Time
 		c.lastLstMs = res.SpkLagMs
 	}
 	err := res.AcousticErr - targetErrMs
-	if !c.closedLoop || !res.Valid || math.Abs(err) <= 5 {
+	// Near overlap, residual Station sound can look like a second TV peak.
+	// Keep the current target until the displacement clears that ambiguity.
+	if !c.closedLoop || !res.Valid || math.Abs(err) <= 15 {
 		c.trackPendingCount = 0
 		c.state = StateHold
 		c.reason = "live_hold"

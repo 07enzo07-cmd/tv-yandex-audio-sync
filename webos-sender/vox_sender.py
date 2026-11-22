@@ -302,6 +302,8 @@ class VoxAudioSender:
         self.luna_vol_proc = None
         self.luna_pwr_proc = None
         self.luna_app_proc = None
+        self.luna_output_proc = None
+        self.bluetooth_output = False
 
     def calc_station_volume_pct(self, tv_vol, is_muted):
         return calc_station_volume_pct(
@@ -566,6 +568,52 @@ class VoxAudioSender:
 
         threading.Thread(target=listener, daemon=True).start()
 
+    def handle_sound_output(self, reply):
+        settings = reply.get("settings")
+        output = settings.get("soundOutput") if isinstance(settings, dict) else None
+        if reply.get("returnValue") is not True or not isinstance(output, str) or not output:
+            return False
+        bluetooth = output in {"bt_soundbar", "tv_speaker_bluetooth", "tv_speaker_bt_surround"}
+        if bluetooth != self.bluetooth_output:
+            self.bluetooth_output = bluetooth
+            print(f"[*] Bluetooth audio output {'active' if bluetooth else 'inactive'}", flush=True)
+        return True
+
+    def _start_sound_output_listener(self):
+        ready = threading.Event()
+        cmd = [
+            "/usr/bin/luna-send", "-i",
+            "luna://com.webos.service.settings/getSystemSettings",
+            '{"category":"sound","keys":["soundOutput"],"subscribe":true}',
+        ]
+
+        def listener():
+            while self.running:
+                try:
+                    with subprocess.Popen(
+                        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, text=True, bufsize=1,
+                    ) as proc:
+                        self.luna_output_proc = proc
+                        if not self.running:
+                            proc.terminate()
+                        for line in proc.stdout:
+                            try:
+                                reply = json.loads(line)
+                            except ValueError:
+                                continue
+                            if isinstance(reply, dict) and self.handle_sound_output(reply):
+                                ready.set()
+                except OSError:
+                    pass
+                finally:
+                    self.luna_output_proc = None
+                if self.running:
+                    time.sleep(2)
+
+        threading.Thread(target=listener, daemon=True).start()
+        ready.wait(1.0)
+
     def _start_sack_listener(self):
         def listener():
             while self.running:
@@ -674,6 +722,7 @@ class VoxAudioSender:
         self._start_volume_listener()
         self._start_power_listener()
         self._start_foreground_app_listener()
+        self._start_sound_output_listener()
         self._start_sack_listener()
 
         seq = 0
@@ -735,7 +784,11 @@ class VoxAudioSender:
                                 self.pending_session_reset = False
                             low_lat = self.low_latency_mode
 
-                        should_stream = self.tv_active and (silence_duration < self.silence_timeout) and not muted_or_zero
+                        bluetooth_output = self.bluetooth_output
+                        should_stream = (
+                            self.tv_active and not bluetooth_output and not muted_or_zero
+                            and silence_duration < self.silence_timeout
+                        )
 
                         if should_stream:
                             if not is_transmitting:
@@ -766,7 +819,9 @@ class VoxAudioSender:
                                 seq = self.send_mute_burst(seq, sample_index)
                                 sample_index = (sample_index + 5 * CHUNK_FRAMES_48K) & 0xFFFFFFFF
                                 reason = f"Power state: {self.power_state}" if not self.tv_active else (
-                                    "Muted/Vol0" if muted_or_zero else f"Silence ({silence_duration:.1f}s)"
+                                    "Bluetooth output" if bluetooth_output else (
+                                        "Muted/Vol0" if muted_or_zero else f"Silence ({silence_duration:.1f}s)"
+                                    )
                                 )
                                 print(f"[-] Pausing SYN3 TX ({reason}) -> Station ALSA released.", flush=True)
                                 gc.collect()
@@ -808,7 +863,7 @@ class VoxAudioSender:
     def stop(self):
         self.running = False
         self.tv_actuator.restore()
-        for proc_attr in ("capture_proc", "luna_vol_proc", "luna_pwr_proc", "luna_app_proc"):
+        for proc_attr in ("capture_proc", "luna_vol_proc", "luna_pwr_proc", "luna_app_proc", "luna_output_proc"):
             proc = getattr(self, proc_attr, None)
             if proc:
                 try:

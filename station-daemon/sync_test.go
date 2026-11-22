@@ -478,6 +478,19 @@ func TestLiveTrackingCorrectsOnlyConfirmedResidual(t *testing.T) {
 	}
 }
 
+func TestLiveTrackingKeepsTargetNearSpeakerOverlap(t *testing.T) {
+	ctrl := NewSyncController(107, true, false)
+	for _, residual := range []float64{8.9, 10.9, 9.6, 9.9, 9.3, 11.1} {
+		result := AcousticResult{
+			Valid: true, TvLagMs: 107 + residual, SpkLagMs: 107,
+			SpkConf: .9, AcousticErr: residual,
+		}
+		if dst, changed := ctrl.HandleLiveTrackResult(result, time.Now()); changed || dst != 107 {
+			t.Fatalf("residual %.1f ms: dst=%d changed=%t", residual, dst, changed)
+		}
+	}
+}
+
 func TestLocalSpeakerProjectionKeepsDelayedExternalSignal(t *testing.T) {
 	const samples = 8192
 	loop, mic, external := make([]float32, samples), make([]float32, samples), make([]float32, samples)

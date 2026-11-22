@@ -451,7 +451,11 @@ type queuedFrame struct {
 
 // Retry a failed clean lock when programme audio becomes measurable. Room
 // estimates made while both speakers play do not count as a clean lock.
-const burstRecoveryDuration = 2 * time.Second
+const (
+	burstRecoveryDuration = 2 * time.Second
+	// Shorter bursts can drain the queue when TV speakers have low latency.
+	burstGapThreshold = 60 * time.Millisecond
+)
 
 func playbackQueueLimit(targetMs float64, hw, recovering bool) int64 {
 	headroomMs := 180.0
@@ -793,6 +797,7 @@ func main() {
 				if time.Now().UnixNano() < burst {
 					if burst != lastHandledBurst {
 						acoustic.ResetAccumulator()
+						ctrl.ResetLiveTracking()
 						lastHandledBurst = burst
 					}
 					continue
@@ -814,6 +819,10 @@ func main() {
 					continue
 				}
 				now := time.Now()
+				if syn3Stream.Load() && now.UnixNano()-atomic.LoadInt64(&lastPacketNano) >= int64(burstGapThreshold) {
+					ctrl.ResetLiveTracking()
+					continue
+				}
 				if ctrl.IsLowLatencyHwMode() {
 					h, changed := ctrl.CalibrateHardwareDelay(res, queueMs, now)
 					if changed {
@@ -827,6 +836,7 @@ func main() {
 				}
 				newDst, corrected := ctrl.HandleLiveTrackResult(res, now)
 				if corrected {
+					acoustic.ResetAccumulator()
 					fmt.Fprintf(os.Stderr, "[live-sync] corrected target to %d ms (residual=%+.1f ms)\n", newDst, res.AcousticErr)
 				}
 				if res.Valid || res.SpkConf >= 0.55 {
@@ -933,22 +943,27 @@ func main() {
 			prevLowLat := atomic.SwapInt32(&atomicLowLatFlag, lowLatVal)
 			lowLatChanged := !wasIdle && (prevLowLat != lowLatVal)
 
-			if wasIdle {
+			startAcquire := wasIdle || (pkt.SessionReset && atomic.LoadInt32(&acquireActive) == 0)
+			if startAcquire {
 				reorder.Reset()
 				atomic.StoreInt32(&acquireActive, 1)
 				ctrl.SetLowLatencyHwMode(pkt.LowLatency)
 				atomic.AddUint64(&playbackEpoch, 1)
-				triggerAcquire("stream_start")
+				reason := "stream_start"
+				if !wasIdle {
+					reason = "audio_onset"
+				}
+				triggerAcquire(reason)
 			}
 
 			if wasIdle || pkt.SessionReset || lowLatChanged {
 				burstRecoveryUntil.Store(0)
-			} else if pkt.ProtoVer == 3 && gap >= int64(100*time.Millisecond) {
+			} else if pkt.ProtoVer == 3 && gap >= int64(burstGapThreshold) {
 				burstRecoveryUntil.Store(nowNano + int64(burstRecoveryDuration))
 				fmt.Fprintf(os.Stderr, "[burst-recovery] seq=%d receive_gap_ms=%.1f\n", pkt.Seq, float64(gap)/float64(time.Millisecond))
 			}
 			ready, majorReset := reorder.Push(pkt)
-			if (majorReset || lowLatChanged) && !wasIdle {
+			if (majorReset || lowLatChanged) && !startAcquire {
 				atomic.AddUint64(&resyncEvents, 1)
 				atomic.AddUint64(&playbackEpoch, 1)
 				// A source marker during an active stream resets DSP tracking.
