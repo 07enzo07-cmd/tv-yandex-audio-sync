@@ -500,7 +500,7 @@ func (c *SyncController) ResetLiveTracking() {
 	c.trackPendingCount = 0
 }
 
-func (c *SyncController) HandleLiveTrackResult(res AcousticResult, now time.Time) (int, bool) {
+func (c *SyncController) HandleLiveTrackResult(res AcousticResult, now time.Time, hdmi bool) (int, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.totalChecks++
@@ -510,7 +510,9 @@ func (c *SyncController) HandleLiveTrackResult(res AcousticResult, now time.Time
 	err := res.AcousticErr - targetErrMs
 	// Near overlap, residual Station sound can look like a second TV peak.
 	// Keep the current target until the displacement clears that ambiguity.
-	if !c.closedLoop || !res.Valid || math.Abs(err) <= 15 {
+	// On HDMI, only a clean startup measurement may change the TV target.
+	// Digital loopback and queue regulation still run during playback.
+	if hdmi || !c.closedLoop || !res.Valid || math.Abs(err) <= 15 {
 		c.trackPendingCount = 0
 		c.state = StateHold
 		c.reason = "live_hold"

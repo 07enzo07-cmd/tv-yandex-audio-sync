@@ -495,6 +495,29 @@ func confirmTvWindows(current AcousticResult, recent []AcousticResult) (Acoustic
 	return AcousticResult{}, false
 }
 
+// HDMI startup requires three independent windows within the same 8 ms band.
+func confirmHDMIWindows(current AcousticResult, recent []AcousticResult) (AcousticResult, bool) {
+	if !current.Valid {
+		return AcousticResult{}, false
+	}
+	for i, first := range recent {
+		if !first.Valid || math.Abs(first.TvLagMs-current.TvLagMs) > 8 {
+			continue
+		}
+		for _, second := range recent[i+1:] {
+			if !second.Valid || math.Abs(second.TvLagMs-current.TvLagMs) > 8 ||
+				math.Abs(first.TvLagMs-second.TvLagMs) > 8 {
+				continue
+			}
+			lo := min(current.TvLagMs, first.TvLagMs, second.TvLagMs)
+			hi := max(current.TvLagMs, first.TvLagMs, second.TvLagMs)
+			current.TvLagMs += first.TvLagMs + second.TvLagMs - lo - hi
+			return current, true
+		}
+	}
+	return AcousticResult{}, false
+}
+
 func main() {
 	port := "12345"
 	if len(os.Args) > 1 {
@@ -698,8 +721,15 @@ func main() {
 				fmt.Fprintf(os.Stderr, "[acquire] Started silent capture (%s)\n", reason)
 
 				acoustic.ResetAccumulator()
-				probeWindows := [...]int{420, 500, 480}
+				probeWindows := []int{420, 500, 480}
 				deadline := started.Add(1780 * time.Millisecond)
+				confirm := confirmTvWindows
+				hdmi := atomic.LoadInt32(&atomicLowLatFlag) != 0
+				if hdmi {
+					probeWindows = []int{750, 850, 950}
+					deadline = started.Add(5250 * time.Millisecond)
+					confirm = confirmHDMIWindows
+				}
 				var recent [4]AcousticResult
 				sampleCount := 0
 				// Leave room for the first packets to align with the microphone ring.
@@ -714,12 +744,16 @@ func main() {
 						break
 					}
 					capturedAt := time.Now()
+					burstAtCapture := burstRecoveryUntil.Load()
 					res := acoustic.AnalyzeCleanTvLag(probeWindows[sampleCount%len(probeWindows)], false, 5.0, 1.15)
+					if hdmi && (capturedAt.UnixNano() < burstAtCapture || burstRecoveryUntil.Load() != burstAtCapture) {
+						res = AcousticResult{Status: "BURST_RECOVERY"}
+					}
 					if acquireEpoch != atomic.LoadUint64(&playbackEpoch) {
 						break
 					}
 					fmt.Fprintf(os.Stderr, "[acquire-check] ltv=%.2f psr=%.2f contrast=%.2f rms_ref=%.4f rms_mic=%.5f status=%s\n", res.TvLagMs, res.TvPsr, res.Contrast, res.RefRms, res.MicRms, res.Status)
-					candidate, ready := confirmTvWindows(res, recent[:])
+					candidate, ready := confirm(res, recent[:])
 					recent[sampleCount%len(recent)] = res
 					sampleCount++
 					if !ready {
@@ -834,7 +868,7 @@ func main() {
 					curQMs := float64(atomic.LoadInt64(&queuedBytes)+int64(player.PipeQueuedBytes())) / 192.0
 					ctrl.UpdateMeasuredAlsaBase(res.SpkLagMs, curQMs)
 				}
-				newDst, corrected := ctrl.HandleLiveTrackResult(res, now)
+				newDst, corrected := ctrl.HandleLiveTrackResult(res, now, atomic.LoadInt32(&atomicLowLatFlag) != 0)
 				if corrected {
 					acoustic.ResetAccumulator()
 					fmt.Fprintf(os.Stderr, "[live-sync] corrected target to %d ms (residual=%+.1f ms)\n", newDst, res.AcousticErr)

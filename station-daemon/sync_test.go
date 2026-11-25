@@ -471,7 +471,7 @@ func TestLiveTrackingCorrectsOnlyConfirmedResidual(t *testing.T) {
 	ctrl := NewSyncController(100, true, false)
 	res := AcousticResult{Valid: true, TvLagMs: 120, SpkLagMs: 100, SpkConf: .9, AcousticErr: 20}
 	for i := 0; i < 3; i++ {
-		dst, changed := ctrl.HandleLiveTrackResult(res, time.Now())
+		dst, changed := ctrl.HandleLiveTrackResult(res, time.Now(), false)
 		if i < 2 && (changed || dst != 100) || i == 2 && (!changed || dst != 112) {
 			t.Fatalf("window %d: dst=%d changed=%t", i, dst, changed)
 		}
@@ -485,7 +485,7 @@ func TestLiveTrackingKeepsTargetNearSpeakerOverlap(t *testing.T) {
 			Valid: true, TvLagMs: 107 + residual, SpkLagMs: 107,
 			SpkConf: .9, AcousticErr: residual,
 		}
-		if dst, changed := ctrl.HandleLiveTrackResult(result, time.Now()); changed || dst != 107 {
+		if dst, changed := ctrl.HandleLiveTrackResult(result, time.Now(), false); changed || dst != 107 {
 			t.Fatalf("residual %.1f ms: dst=%d changed=%t", residual, dst, changed)
 		}
 	}
@@ -550,5 +550,30 @@ func TestPCMRetimerPreservesPhaseAcrossPacketBoundaries(t *testing.T) {
 	}
 	if rms := math.Sqrt(errorPower / float64(countCompared)); rms > 55 {
 		t.Fatalf("retiming adds excessive error across packet boundaries: %.2f RMS", rms)
+	}
+}
+
+func TestHDMIRequiresConsensusAndProtectsCleanTarget(t *testing.T) {
+	peak := func(lag float64) AcousticResult {
+		return AcousticResult{Valid: true, TvLagMs: lag, TvConf: .9}
+	}
+	if _, ok := confirmHDMIWindows(peak(42), []AcousticResult{peak(40), peak(224)}); ok {
+		t.Fatal("accepted a pair of windows with a distant third peak")
+	}
+	clean, ok := confirmHDMIWindows(peak(42), []AcousticResult{peak(40), peak(41), peak(224)})
+	if !ok || clean.TvLagMs != 41 {
+		t.Fatalf("expected median of the three agreeing peaks, got %+v", clean)
+	}
+	ctrl := NewSyncController(49, true, false)
+	ctrl.SetLowLatencyHwMode(true)
+	_, dst, _, _ := ctrl.HandleAcquireResult(clean, time.Now())
+	mixed := AcousticResult{Valid: true, TvLagMs: 224, SpkLagMs: 51, AcousticErr: 173, SpkConf: .9}
+	for i := 0; i < 5; i++ {
+		if got, changed := ctrl.HandleLiveTrackResult(mixed, time.Now(), true); changed || got != dst {
+			t.Fatalf("mixed peak moved clean delay from %d to %d", dst, got)
+		}
+	}
+	if got := ctrl.Snapshot(0, time.Now()).LtvMs; got != 41 {
+		t.Fatalf("mixed peak poisoned the clean TV measurement: %.1f", got)
 	}
 }
